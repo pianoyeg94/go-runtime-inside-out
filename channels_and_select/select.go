@@ -1,7 +1,7 @@
 package channels
 
 import (
-	"internal/abi"
+	// "internal/abi"
 	"unsafe"
 )
 
@@ -137,6 +137,7 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	// in lockorder to no lock same channel twice).
 	// Use simple heap sort, to guarantee n log n time and constant stack footprint.
 	for i := range lockorder {
+		_ = i
 		// TODO!!!!!!
 	}
 
@@ -226,4 +227,5 @@ func reflect_rselect(cases []runtimeSelect) (int, bool) {
 	}
 
 	order := make([]uint16, 2*(nsends+nrecvs)) // TODO!!!!!
+	_ = order
 }

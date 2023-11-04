@@ -3,7 +3,7 @@ package heap
 import (
 	"unsafe"
 
-	"github.com/pianoyeg94/golang-runtime/channels/atomic"
+	"github.com/pianoyeg94/go-runtime-inside-out/memory_and_heap/atomic"
 )
 
 const (

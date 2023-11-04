@@ -3,7 +3,7 @@ package channels
 import (
 	"unsafe"
 
-	"github.com/pianoyeg94/golang-runtime/channels/atomic"
+	"github.com/pianoyeg94/go-runtime-inside-out/channels_and_select/atomic"
 )
 
 // defined constants
