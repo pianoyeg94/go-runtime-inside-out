@@ -1,0 +1,146 @@
+src/sync/map.go:Map.Store()
+
+func (m *Map) Store(key, value any) {}
+
+1) First atomically loads the readOnly container which stores the underlying read-only map header.
+   Will not conflict with concurrent dirty to read-only map promotion, because the readOnly container 
+   is retrieved by value. This means if a promotion happens while we're working with a local copy of readOnly,
+   the copy's map header will still be pointing to the old read-only map, even if the original readOnly map header
+   is pointing to a new promoted map.
+   
+
+2) Checks whether the requested key is already present in the underlying read-only map.
+   This operation isn't atomic or guarded by a mutex, but at the same time isn't prone 
+   to race conditions because:
+      - The value pointers stored in the read-only map are wrapped into pointers to entries. 
+      - The entry pointers themselves aren't manipulated in any way.
+   
+   Due to the schema described above:
+      - A concurrent store will not change the entry pointer, it will only modify
+        the contents of the entry.
+
+      - A concurrent deletion of the value from the read-only map only sets the underlying
+        pointer stored in the entry to nil.
+
+      - A concurrent promotion of the dirty map to read-only doesn't touch 
+        the current entry pointers from the read-only map - they're stored in both places. 
+        So when the read-only map is overwritten by the dirty map we still have all of our old
+        entry pointers in place.
+
+      - A concurrent creation of a dirty map after it was promoted just copies the entry pointers
+        without actually modifying their contents. 
+        If some value was deleted from the read-only map, the pointer to it, wrapped in an entry,
+        will just be set to expunged and not included in the new dirty map - the next time a 
+        promotion happens those entries will not be present in the read-only map.
+
+   If the key is present in the read-only map it means that it is still valid or was deleted
+   not so long ago - its value could be either nill or expunged (if a new dirty map copy has
+   been created in the mean time).
+
+3)  If the key is present in the read-only map, we attempt to store a pointer to the passed in value 
+    within the retrieved entry pointer using a lock-free spinning lock pattern.
+
+    This part is atomic, because it's a retry loop consisting of an atomic load and an
+    atomic compare-and-swap operation:
+      - Atomically loads the value pointer from the entry.
+
+      - Checks whether the retrieved pointer is equal to expunged, if it is, this part will be no-op, 
+        because it means the entry isn't present in the dirty map, which is our final source of truth.
+
+      - Tries to atomically compare and swap the previously retrieved pointer and the new value
+        pointer, if the swap fails, it means that in the mean time some other concurrent operation 
+        has modified our value.
+
+      - We keep looping, perfroming atomic load, check against expunged and atomic compare-and-swap
+        until compare-and-swap yields success or the value pointer becomes expunged, meaning
+        it's no longer present in the dirty map. This happens after an entry is deleted and we have
+        so many read-only map misses that we need to promote the dirty map to read-only.
+
+    May conflict with the following operations, which may result in a tight spinning loop or
+    the entry becoming stale, which will cause us to acquire the Map's mutex and perform a write to
+    the dirty map.
+      - Concurrent store if it performs the store in read-only map path or it needs 
+        to create a new dirty map and some of the entries in the read-only map are deleted
+
+      - Concurrent LoadOrStore if it performs the store in read-only map path or it needs 
+        to create a new dirty map and some of the entries in the read-only map are deleted
+
+      - Concurrent delete 
+
+      - Concurrent LoadAndDelete
+
+4) If the key is not present in the read-only map or it was expunged by a concurrent operation 
+   while we were trying to atomically store it in the read-only map, we consider it to be a 
+   new key which needs to be stored in the dirty map. This requires us to acquire the Map's
+   mutex to guard all operations on the dirty map.
+
+5) While holding the mutex we try to re-read the key from the read-only map following steps 1 and 2.
+   We need to do this because:
+    - The key could have been expunged before this method was called and we get a chance of 
+      reusing the same key in the read-only map, which will speed up our loads and disjoint updates. 
+      But at the same time we also need to update the dirty map, because it's our final source of 
+      truth and it needs to hold the same active entry pointers as the read-only map.
+
+    - The key could have been concurrently expunged after a dirty map promotion and a creation 
+      of a new dirty map which could have followed the promotion. This all could have happened 
+      after we've completed steps 1 through 3. It means we get a chance of reusing the same key in 
+      the read-only map, which will speed up our loads and disjoint updates. But at the same time 
+      we also need to update the dirty map, because it's our final source of truth and it needs 
+      to hold the same active entry pointers as the read-only map.
+
+    - The key was concurrently stored and the dirty map got promoted to read-only after we've completed
+      steps 1 through 3. It means we get a chance of reusing the same key in the read-only, 
+      which will speed up our loads and disjoint updates. It also means that the key is already 
+      present in the dirty map, so we don't need to touch it.
+
+   1. If the key was already expunged before this method was called or it was expunged concurrently,
+      while the previous lock-free section was executing or just before acquiring the mutex, then:
+        - We atomically compare-and-swap out expunged for nil which will always succeeds because
+          an expunged entry can only be revived while holding the map mutex, which we currently are. 
+        - We store the entry pointer holding a nil value within the dirty map
+        - We atomically store a pointer to the new value within the entry pointer, which will reflect
+          the changes in the read-only and dirty map at the same time.
+
+   2. If the key was concurrently stored in the dirty map and it got promoted to read-only, while 
+      the previous lock-free section was executing or just before acquiring the mutex, 
+      then the entry already exists in the dirty map, and we just need to atomically store a pointer 
+      to the new value within the entry pointer, which will reflect the changes in the read-only 
+      and dirty map at the same time.
+
+6) If the key is not present in the read-only map we check if it's present in the dirty map while still 
+   holding the mutex. If the check yields a positive result we just atomically store a pointer 
+   to the new value within the entry pointer. The dirty map is still the only holder 
+   of this paricular entry, but it may arrive at the read-only map when an upcoming promotion 
+   occurs.
+
+7) If the key is not present in the read-only and dirty map, it means that we're dealing with a 
+   totally new key and we need to create an entry for it in the dirty map.
+    - If a promotion happend before or while this method was executing and the dirty map is still nil, 
+      it means that we need to perform a copy of the read-only into the dirty map transfroming nil key values
+      into expunged pointers and not including them in the dirty map.
+      This includes:
+        - Atomically loading the readOnly container which contains the underlying read-only map header.
+          Will not conflict with concurrent dirty to read-only map promotion, because the readOnly container 
+          is retrieved by value. This means if a promotion happens while we're working with a local copy of readOnly,
+          the copy's map header will still be pointing to the old read-only map, even if the original readOnly map header
+          is pointing to a new promoted map.
+
+        - Making a new dirty map with the same capacity as the read-only map (remember, we're still holding the mutex)
+
+        - Copying the contents of the read-only map key by key into the new dirty map atomically setting nil value pointers
+          to expunged (spinlock pattern). The expunged entries will not be copied over to the dirty map and will be
+          disappear from the read-only map when the next promotion happens, if no one stored a new value in the expunged
+          key in the mean time.
+
+        - Atomically setting read-only map's ammended attribute to true, signifying that some key exists in the dirty map
+          but doesn't in the read-only map.
+
+    - Stores the key value pointer wrappped in an entry pointer inside the dirty map 
+      (remember, we're still holding the mutex)
+
+8) Releases the Map mutex and returns
+
+
+ 
+
+

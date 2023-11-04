@@ -1,0 +1,293 @@
+type pageBits [pallocChunkPages / 64]uint64
+
+Is a bitmap representing one bit per page in a palloc chunk.
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+type pallocBits pageBits
+
+Is a bitmap that tracks page allocations for at most one palloc chunk.
+
+The precise representation is an implementation detail, but for the
+sake of documentation, 0s are free pages and 1s are allocated pages.
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func (b *pallocBits) summarize() pallocSum {}
+
+Returns a packed summary of the bitmap in pallocBits.
+
+If all pages tracked by this bitmap chunk are free returns a pallocSum
+where start, max and end are set to 512 (pages).
+
+Otherwise start is set to the number of zero bits/free pages up to the first 
+1 bit/allocated page.
+
+Max is set to the largest run of contiguous zero bits within the chunk.
+
+And end is set to to the number of zero bits/free pages from the end of the chunk
+going down to the first 1 bit/allocated page.
+
+// x = 0000001111110000000000000000000000000000000000000000000000001000 = 283726776524341256
+
+	// We already know the trailing zeros are no larger than max. Remove them.
+	// x >>= sys.TrailingZeros64(x) & 63
+	// x = 0000000001111110000000000000000000000000000000000000000000000001 = 35465847065542657
+
+	// if x&(x+1) == 0 { // no more zeros (except at the top).
+	// 	continue
+	// }
+	//
+	// if x would have been equal to 0000001111111111111111111111111111111111111111111111111111111000,
+	// where there's no internal run of zeros, then x >>= sys.TrailingZeros64(x) & 63 would have been equal to
+	// 0000000001111111111111111111111111111111111111111111111111111111. By adding 1 to it (x + 1),
+	// it would become 0000000010000000000000000000000000000000000000000000000000000000, so x&(x+1)
+	// would be zero, meaning that there's no internal run of zeros.
+
+	// max = 20
+	// k = 1
+
+	// First iteration for p > 0 {} and p > k:
+	// p = 20
+	// k = 1
+	//
+	// x >> (k & 63) = x >> 1 = 0000000000111111000000000000000000000000000000000000000000000000
+	//
+	// x |= x >> (k & 63):
+	//   0000000001111110000000000000000000000000000000000000000000000001
+	//   0000000000111111000000000000000000000000000000000000000000000000
+	//   0000000001111111000000000000000000000000000000000000000000000001
+	//
+	// x |= x >> (k & 63) = 0000000001111111000000000000000000000000000000000000000000000001 (internal run of zeroes shrunk by 1)
+
+	// Second iteration for p > 0 {} and p > k:
+	// p = 19
+	// k = 2
+	//
+	// x >> (k & 63) = x >> 2 = 0000000000011111110000000000000000000000000000000000000000000000
+	//
+	// x |= x >> (k & 63):
+	//   0000000001111111000000000000000000000000000000000000000000000001
+	//   0000000000011111110000000000000000000000000000000000000000000000
+	//   0000000001111111110000000000000000000000000000000000000000000001
+	//
+	// x |= x >> (k & 63) = 0000000001111111110000000000000000000000000000000000000000000001
+	// (internal run of zeroes shrunk by 2, 2 + 1 = 3, shrunk by 3 all together)
+
+	// Third iteration for p > 0 {} and p > k:
+	// p = 17 (already shrunk by 3 out of 20 max)
+	// k = 4
+	//
+	// x >> (k & 63) = x >> 4 = 0000000000000111111111000000000000000000000000000000000000000000
+	//
+	// x |= x >> (k & 63):
+	//   0000000001111111110000000000000000000000000000000000000000000001
+	//   0000000000000111111111000000000000000000000000000000000000000000
+	//   0000000001111111111111000000000000000000000000000000000000000001
+	//
+	// x |= x >> (k & 63) = 0000000001111111111111000000000000000000000000000000000000000001
+	// (internal run of zeroes shrunk by 4, 4 + 3 = 7, shrunk by 7 all together)
+
+	// Fourth iteration for p > 0 {} and p > k:
+	// p = 13 (already shrunk by 7 out of 20 max)
+	// k = 8
+	//
+	// x >> (k & 63) = x >> 8 = 0000000000000000011111111111110000000000000000000000000000000000
+	//
+	// x |= x >> (k & 63):
+	//   0000000001111111111111000000000000000000000000000000000000000001
+	//   0000000000000000011111111111110000000000000000000000000000000000
+	//   0000000001111111111111111111110000000000000000000000000000000001
+	//
+	// x |= x >> (k & 63) = 0000000001111111111111111111110000000000000000000000000000000001
+	// (internal run of zeroes shrunk by 8, 8 + 7 = 15, shrunk by 15 all together)
+
+	// Fifth iteration for p > 0 {} and p <= k:
+	// p = 5 (already shrunk by 15 out of 20 max)
+	// k = 16
+	//
+	// x |= x >> (p & 63) = x >> 5 = 0000000000000011111111111111111111100000000000000000000000000000
+	//
+	// x |= x >> (p & 63):
+	//   0000000001111111111111111111110000000000000000000000000000000001
+	//   0000000000000011111111111111111111100000000000000000000000000000
+	//   0000000001111111111111111111111111100000000000000000000000000001
+	//
+	// x |= x >> (p & 63) = 0000000001111111111111111111111111100000000000000000000000000001
+	// (internal run of zeroes shrunk by 5, 15 + 5 = 20, shrunk by 20 all together, shrunk by max, but there are zeroes still left,
+	//  we have a new max)
+
+	// The length of the lowest-order zero run is an increment to our maximum.
+	// j := uint(sys.TrailingZeros64(^x)) // count contiguous trailing ones, only one one in this case
+	// x >>= j & 63 = x >> 1 = 0000000000111111111111111111111111110000000000000000000000000000
+	//
+	// j = uint(sys.TrailingZeros64(x))   // count contiguous trailing zeros, 28 zeroes in this case, max should be incremented by 28
+	//
+	// x >>= j & 63 = x >> 28 = 0000000000000000000000000000000000000011111111111111111111111111   // remove zeros
+	//
+	// max += j = max + 28 = 48 // we have a new maximum!
+	//
+	// if x&(x+1) == 0 {                  // no more zeros (except at the top), this was the last run of internal zeroes
+	// continue outer
+	// }
+	//
+	// p = j // remove j more zeros from each zero run, check if some other left over run is greater than 28
+
+	// ----------------------------------------------------------------------------------------------------------------
+	// ----------------------------------------------------------------------------------------------------------------
+
+	// max = 20
+	// k = 1
+
+	//                    26 zeroes                 21 zeroes
+	// x = 0000001111110000000000000000000000000010000000000000000000001000 = 283726776524341256
+
+	// We already know the trailing zeros are no larger than max. Remove them.
+	// x >>= sys.TrailingZeros64(x) & 63
+	// x = 0000000001111110000000000000000000000000010000000000000000000001 = 35465847069736961
+
+	// First iteration for p > 0 {} and p > k:
+	// p = 20
+	// k = 1
+	//
+	// x >> (k & 63) = x >> 1 = 0000000000111111000000000000000000000000001000000000000000000000
+	//
+	// x |= x >> (k & 63):
+	//   0000000001111110000000000000000000000000010000000000000000000001
+	//   0000000000111111000000000000000000000000001000000000000000000000
+	//   0000000001111111000000000000000000000000011000000000000000000001
+	//
+	// x |= x >> (k & 63) = 0000000001111111000000000000000000000000011000000000000000000001 (both internal runs of  zeroes shrunk by 1)
+
+	// Second iteration for p > 0 {} and p > k:
+	// p = 19
+	// k = 2
+	//
+	// x >> (k & 63) = x >> 2 = 0000000000011111110000000000000000000000000110000000000000000000
+	//
+	// x |= x >> (k & 63):
+	//   0000000001111111000000000000000000000000011000000000000000000001
+	//   0000000000011111110000000000000000000000000110000000000000000000
+	//   0000000001111111110000000000000000000000011110000000000000000001
+	//
+	// x |= x >> (k & 63) = 0000000001111111110000000000000000000000011110000000000000000001 (both internal runs of zeroes shrunk by 3)
+
+	// Third iteration for p > 0 {} and p > k:
+	// p = 17
+	// k = 4
+	//
+	// x >> (k & 63) = x >> 4 = 0000000000000111111111000000000000000000000001111000000000000000
+	//
+	// x |= x >> (k & 63):
+	//   0000000001111111110000000000000000000000011110000000000000000001
+	//   0000000000000111111111000000000000000000000001111000000000000000
+	//   0000000001111111111111000000000000000000011111111000000000000001
+	//
+	// x |= x >> (k & 63) = 0000000001111111111111000000000000000000011111111000000000000001 (both internal runs of zeroes shrunk by 7)
+
+	// Fourth iteration for p > 0 {} and p > k:
+	// p = 13
+	// k = 8
+	//
+	// x >> (k & 63) = x >> 8 = 0000000000000000011111111111110000000000000000000111111110000000
+	//
+	// x |= x >> (k & 63):
+	//   0000000001111111111111000000000000000000011111111000000000000001
+	//   0000000000000000011111111111110000000000000000000111111110000000
+	//   0000000001111111111111111111110000000000011111111111111110000001
+	//
+	// x |= x >> (k & 63) = 0000000001111111111111111111110000000000011111111111111110000001 (both internal runs of zeroes shrunk by 15)
+
+	// Fourth iteration for p > 0 {} and p <= k:
+	// p = 5
+	// k = 16
+	//
+	// x >> (p & 63) = x >> 5 = 0000000000000011111111111111111111100000000000111111111111111100
+	//
+	// x |= x >> (k & 63):
+	//   0000000001111111111111111111110000000000011111111111111110000001
+	//   0000000000000011111111111111111111100000000000111111111111111100
+	//   0000000001111111111111111111111111100000011111111111111111111101
+	//
+	// x |= x >> (k & 63) = 0000000001111111111111111111111111100000011111111111111111111101 (both internal runs of zeroes shrunk by 20, previous max)
+
+	// The length of the lowest-order zero run is an increment to our maximum.
+	// j := uint(sys.TrailingZeros64(^x)) // count contiguous trailing ones = 1 trailing 1
+
+	// x >>= j & 63 = 0000000000111111111111111111111111110000001111111111111111111110 // remove trailing ones
+
+	// j = uint(sys.TrailingZeros64(x))   // count contiguous trailing zeros = 1 trailing zero
+
+	// x >>= j & 63 = 0000000000011111111111111111111111111000000111111111111111111111  // remove zeros
+
+	// max += j = 21                         // we have a new maximum!
+	// if x&(x+1) == 0 {                  // no more zeros (except at the top).
+	// continue outer
+	// }
+
+	// p = j // remove j more zeros from each zero run, we still have 6 internal zeros, need to remove 1 zero to get 21, and after
+	//       // that we can count
+
+	// at this point new max is 21
+
+	// Fifth iteration for p > 0 {} and p <= k:
+	// p = 1
+	// k = 16
+	//
+	// x >> (p & 63) = x >> 1 = 0000000000001111111111111111111111111100000011111111111111111111
+	//
+	// x |= x >> (k & 63):
+	//   0000000000011111111111111111111111111000000111111111111111111111
+	//   0000000000001111111111111111111111111100000011111111111111111111
+	//   0000000000011111111111111111111111111100000111111111111111111111
+	//
+	// x |= x >> (k & 63) = 0000000000011111111111111111111111111100000111111111111111111111 (last internal run of zeroes shrunk by 21)
+
+	// // The length of the lowest-order zero run is an increment to our maximum.
+	// j := uint(sys.TrailingZeros64(^x)) // count contiguous trailing ones = 21 trailing ones
+
+	// x >>= j & 63   0000000000000000000000000000000011111111111111111111111111100000     // remove trailing ones
+
+	// j = uint(sys.TrailingZeros64(x)) = 5  // count contiguous trailing zeros
+
+	// x >>= j & 63 = 0000000000000000000000000000000000000111111111111111111111111111     // remove zeros
+
+	// max += j = 26  // we have a new maximum!
+
+	// if x&(x+1) == 0 {                  // no more zeros (except at the top).
+	// continue outer                     // new max is 26 and we contniue to next uint64
+	// }
+
+
+------------------------------------------------------------------------------------------------------------
+
+func findBitRange64(c uint64, n uint) uint {}
+
+c = 1000001111110000000000000000000000000010000000000000000000001001 = 9507098813412671497
+n = 4
+p = 3
+k = 1
+
+First iteration for p > 0 {} and p > k:
+	c >> 1 =        0100000111111000000000000000000000000001000000000000000000000100
+	c &= c >> 1     1000001111110000000000000000000000000010000000000000000000001001 // c
+	c  =            0000000111110000000000000000000000000000000000000000000000000000 
+
+	p = 2
+	k = 2
+
+Second iteration for p > 0 {} and p <= k:
+	c >> 2 =        0000000001111100000000000000000000000000000000000000000000000000
+	c &= c >> 2     0000000111110000000000000000000000000000000000000000000000000000 // c
+	c =             0000000001110000000000000000000000000000000000000000000000000000
+
+// Find first remaining 1.
+// Since we shrunk from the top down, the first 1 is in
+// its correct original position.
+uint(sys.TrailingZeros64(c)) = 52
+return 52
+

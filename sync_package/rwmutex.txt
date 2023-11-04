@@ -1,0 +1,149 @@
+Max simultaneous readers = 1073741824
+
+A RWMutex is a reader/writer mutual exclusion lock.
+The lock can be held by an arbitrary number of readers or a single writer.
+The zero value for a RWMutex is an unlocked mutex.
+
+A RWMutex must not be copied after first use.
+
+If a goroutine holds a RWMutex for reading and another goroutine might
+call Lock, no goroutine should expect to be able to acquire a read lock
+until the initial read lock is released. In particular, this prohibits
+recursive read locking. This is to ensure that the lock eventually becomes
+available; a blocked Lock call excludes new readers from acquiring the
+lock.
+
+---------------------------------------------------------------------------------------
+
+
+Rlock()
+
+func (rw *RWMutex) RLock() {}
+
+Locks rw for reading.
+
+1) Atomically increments the reader count. 
+   If no writer is pending this is the only cost of acquiring the lock for reading.
+
+2) If the reader count is negative, it means that a writer substracted rwmutexMaxReaders from reader count, 
+   thus it's currently pending on acquiring the lock, so we block on the reader semaphore to give way 
+   for the pending writer. 
+
+   We will be unblocked by the writer when it releases the lock (will unblock all pending readers).
+   The reader count will be also restored to its previous positive state taking all pending readers
+   into account.
+
+   After that no other pending writer can take priority over us and all of the already pending readers,
+   because it will block on a writer semaphore until it's released by the last pending reader.
+   At the same time all new readers will block because the writer announced that it is pending by
+   already decrementing reader count.
+
+   The above described mechanism will happen over and over again if readers and writers 
+   keep taking turns on the lock.
+
+3) There's also a pretty good chance of this function to be inlined, 
+   if aqcuiring the lock for reading only takes one atomic add operation without blocking on the
+   reader semaphore.
+
+---------------------------------------------------------------------------------------
+
+
+RUnlock()
+
+func (rw *RWMutex) RUnlock() {}
+
+RUnlock undoes a single RLock call;
+it does not affect other simultaneous readers.
+It is a run-time error if rw is not locked for reading
+on entry to RUnlock.
+
+1) In the cheapest scenario, if the reader is not the last to runlock the mutex,
+   the reader count of the mutex is just atomically decremented, in this case it's very
+   likely that this call will be inlined.
+
+2) If RUnlock is called on an unlocked mutex without a pending writer, an error will be immediately 
+   detected and a panic will be thrown, because the reader count will drop bellow 0.
+
+   When a writer is pending on the lock, the reader count will be decremented by 1073741824, so if
+   no reader is holding the lock, the reader count will become 0 - 1073741824 = -1073741824.
+   If RUnlock is called in these conditions without a single reader holding the lock, reader count will
+   become -1073741824 - 1 = -1073741825. And so, by adding 1 to -1073741825, we will detect that there
+   was an attempt to RUnlock an already unlocked mutex and a panic will be thrown.
+
+3) When a writer tries to acquire the lock through a Lock call, it atomically decrements 
+   the current reader count by 1073741824, transfroming it almost certainly into a negative number.
+   It's highly unlikely that there will be 1073741824 simultaneously readers.
+   Reader count becoming a negative number announces to all of the upcoming readers, that they should
+   wait unitl this writer releases the lock. All pending readers will block on a reader semaphore
+   and will be woken up by the writer when it releases the lock. At this point no other upcoming writer 
+   is able sneek through because the reader semaphore will be released while still holding the underlying
+   Mutex. All new upcoming readers will also have a chance until the underlying mutex is unlocked. 
+   But after that all new readers will block on the on the reader semaphore if there's another
+   pending writer because reader count will be decremented by a writer before 
+   blocking on the writer semaphore.
+
+
+---------------------------------------------------------------------------------------
+
+
+Lock()
+
+func (rw *RWMutex) Lock() {}
+
+Locks rw for writing.
+If the lock is already locked for reading or writing,
+blocks until the lock is available.
+
+1) First tries to acquire the underlying Mutex instance to resolve 
+   competition with other writers. Basically at this point it works as a normal
+   Mutex.
+
+2) Atomically decrements the current reader count by 1073741824, transfroming it almost certainly 
+   into a negative number. It's highly unlikely that there will be 1073741824 simultaneously readers.
+   Reader count becoming a negative number announces to all of the upcoming readers, that they should
+   wait unitl this writer releases the lock. All new readers will block on a reader semaphore.
+
+3) We still have to wait for all active readers if any before really acquiring the lock.
+   We calculate the current reader count by adding the same 1073741824 value back to the negated
+   reader count (into a local variable). If the value is not 0 we block on a writer semaphore.
+   The last reader will unblock us.
+
+
+---------------------------------------------------------------------------------------
+
+Unlock()
+
+func (rw *RWMutex) Unlock() {}
+
+Unlocks rw for writing.
+It is a run-time error if rw is
+not locked for writing on entry to Unlock.
+
+As with Mutexes, a locked RWMutex is not associated with a particular
+goroutine. One goroutine may RLock (Lock) a RWMutex and then
+arrange for another goroutine to RUnlock (Unlock) it.
+
+1) Atomically increments reader count, which announces to new readers, that there
+   is no active writer. At this point the underlying mutex isn't released yet, so any
+   pending writers will not interfere with the new readers.
+   
+   Reader count is incremented by 1073741824 to restore it back to a positive number, 
+   because it's value was negative while this particular writer was holding the lock.
+   The restored reader count is equal to the number of pending readers, which blocked on
+   the reader semaphore while this particular writer was holding the lock.
+
+   If the restored reader count is greater than 1073741824, it means that its value was
+   already positive, so we're dealing with an unclock of an unlocked mutex. In this case
+   a panic will be thrown.
+
+2) Unblocks all pending readers which queued up on the reader semaphore while this particular
+   writer was holding the lock. 
+
+3) Releases the underlying mutex to give way to new and already pending writers.
+   Up till know all of the new and pending readers had a chance to aqcuire the lock for reading,
+   but now a new writer may acquire the lock and block any new readers.
+   
+
+
+
+   

@@ -1,0 +1,346 @@
+Two common ways of presenting multipart electronic messages are as a
+main document with a list of separate attachments, and as a single
+document with the various parts expanded (displayed) inline. The
+display of an attachment is generally construed to require positive
+action on the part of the recipient, while inline message components
+are displayed automatically when the message is viewed. A mechanism
+is needed to allow the sender to transmit this sort of presentational
+information to the recipient; the Content-Disposition header provides
+this mechanism, allowing each component of a message to be tagged
+with an indication of its desired presentation semantics.
+
+In addition to allowing the sender to specify the presentational
+disposition of a message component, it is desirable to allow her to
+indicate a default archival disposition; a filename. The optional
+"filename" parameter provides for this.  Further, the creation-date,
+modification-date, and read-date parameters allow preservation of
+those file attributes when the file is transmitted over MIME email.
+
+
+The Content-Disposition Header Field
+======================================================================
+Content-Disposition is an optional header field. In its absence, the
+implementers may use whatever presentation method it deems suitable.
+
+It is desirable to keep the set of possible disposition types small
+and well defined, to avoid needless complexity. Even so, evolving
+usage will likely require the definition of additional disposition
+types or parameters, so the set of disposition values is extensible.
+
+In the extended BNF notation of [RFC 822], the Content-Disposition
+header field is defined as follows:
+
+    disposition := "Content-Disposition" ":"
+                    disposition-type
+                    *(";" disposition-parm)
+
+    disposition-type := "inline"
+                      / "attachment"
+                      / extension-token
+                      ; values are not case-sensitive
+
+    disposition-parm := filename-parm
+                      / creation-date-parm
+                      / modification-date-parm
+                      / read-date-parm
+                      / size-parm
+                      / parameter
+
+    filename-parm := "filename" "=" value
+
+    creation-date-parm := "creation-date" "=" quoted-date-time
+
+    modification-date-parm := "modification-date" "=" quoted-date-time
+
+    read-date-parm := "read-date" "=" quoted-date-time
+
+    size-parm := "size" "=" 1*DIGIT
+
+    quoted-date-time := quoted-string
+                     ; contents MUST be an RFC 822 `date-time'
+                     ; numeric timezones (+HHMM or -HHMM) MUST be used
+
+    quoted-string     = <"> *(qtext/quoted-pair) <">; Regular qtext or
+                                                    ;   quoted chars.
+
+    qtext             =  <any CHAR excepting <">,     ; => may be folded
+                           "\" & CR, and including
+                           linear-white-space>
+
+    quoted-pair       =  "\" CHAR                     ; may quote any char
+
+    date-time         =  [ day "," ] date time        ; dd mm yy
+                                                       ;  hh:mm:ss zzz
+           
+    day               =  "Mon"  / "Tue" /  "Wed"  / "Thu"
+                      /  "Fri"  / "Sat" /  "Sun"
+          
+    date              =  1*2DIGIT month 2DIGIT        ; day month year
+                                                      ;  e.g. 20 Jun 82
+          
+    month             =  "Jan"  /  "Feb" /  "Mar"  /  "Apr"
+                      /  "May"  /  "Jun" /  "Jul"  /  "Aug"
+                      /  "Sep"  /  "Oct" /  "Nov"  /  "Dec"
+          
+    time              =  hour zone                    ; ANSI and Military
+          
+    hour              =  2DIGIT ":" 2DIGIT [":" 2DIGIT]
+                                                      ; 00:00:00 - 23:59:59
+          
+    zone              =  "UT"  / "GMT"                ; Universal Time
+                                                      ; North American : UT
+                      /  "EST" / "EDT"                ;  Eastern:  - 5/ - 4
+                      /  "CST" / "CDT"                ;  Central:  - 6/ - 5
+                      /  "MST" / "MDT"                ;  Mountain: - 7/ - 6
+                      /  "PST" / "PDT"                ;  Pacific:  - 8/ - 7
+                      /  1ALPHA                       ; Military: Z = UT;
+                                                      ;  A:-1; (J not used)
+                                                      ;  M:-12; N:+1; Y:+12
+                      / ( ("+" / "-") 4DIGIT )        ; Local differential
+                                                      ;  hours+min. (HHMM)
+
+
+NOTE ON PARAMETER VALUE LENGHTS: A short (length <= 78 characters)
+parameter value containing only non-`tspecials' characters SHOULD be
+represented as a single `token'.  A short parameter value containing
+only ASCII characters, but including `tspecials' characters, SHOULD
+be represented as `quoted-string'.  Parameter values longer than 78
+characters, or which contain non-ASCII characters, MUST be encoded as
+specified in [RFC 2184]:
+    Long MIME media type or disposition parameter values do not interact
+    well with header line wrapping conventions.  In particular, proper
+    header line wrapping depends on there being places where linear
+    whitespace (LWSP) is allowed, which may or may not be present in a
+    parameter value, and even if present may not be recognizable as such
+    since specific knowledge of parameter value syntax may not be
+    available to the agent doing the line wrapping. The result is that
+    long parameter values may end up getting truncated or otherwise
+    damaged by incorrect line wrapping implementations.
+
+    The obvious solution, then, is to use multiple parameters to contain
+    a single parameter value and to use some kind of distinguished name
+    to indicate when this is being done.  And this obvious solution is
+    exactly what is specified here: The asterisk character ("*") followed
+    by a decimal count is employed to indicate that multiple parameters
+    are being used to encapsulate a single parameter value.  The count
+    starts at 0 and increments by 1 for each subsequent section of the
+    parameter value.  Decimal values are used and neither leading zeroes
+    nor gaps in the sequence are allowed.
+ 
+    The original parameter value is recovered by concatenating the
+    various sections of the parameter, in order.  For example, the
+    content-type field
+
+    Content-Type: message/external-body; access-type=URL;
+      URL*0="ftp://";
+      URL*1="cs.utk.edu/pub/moore/bulk-mailer/bulk-mailer.tar"
+
+    is semantically identical to
+
+    Content-Type: message/external-body; access-type=URL;
+      URL="ftp://cs.utk.edu/pub/moore/bulk-mailer/bulk-mailer.tar"
+ 
+    Note that quotes around parameter values are part of the value
+    syntax; they are NOT part of the value itself.  Furthermore, it is
+    explicitly permitted to have a mixture of quoted and unquoted
+    continuation fields.
+
+
+The Inline Disposition Type
+======================================================================
+A bodypart should be marked `inline' if it is intended to be
+displayed automatically upon display of the message.  Inline
+bodyparts should be presented in the order in which they occur,
+subject to the normal semantics of multipart messages.
+
+
+The Attachment Disposition Type
+======================================================================
+Bodyparts can be designated `attachment' to indicate that they are
+separate from the main body of the mail message, and that their
+display should not be automatic, but contingent upon some further
+action of the user. Implementers might instead present the user of a
+bitmap terminal with an iconic representation of the attachments, or,
+on character terminals, with a list of attachments from which the
+user could select for viewing or storage.
+
+
+The Filename Parameter
+======================================================================
+The sender may want to suggest a filename to be used if the entity is
+detached and stored in a separate file. If the receiving implementer 
+writes the entity to a file, the suggested filename should be used as 
+a basis for the actual filename, where possible.
+
+It is important that the receiving implementer not blindly use the suggested
+filename.  The suggested filename SHOULD be checked (and possibly
+changed) to see that it conforms to local filesystem conventions,
+does not overwrite an existing file, and does not present a security
+problem (see Security Considerations below).
+
+The receiving implementer SHOULD NOT respect any directory path information
+that may seem to be present in the filename parameter.  The filename
+should be treated as a terminal component only.
+
+Current [RFC 2045] grammar restricts parameter values (and hence
+Content-Disposition filenames) to US-ASCII.
+
+Beyond the limitation to US-ASCII, the sending implementer may wish to bear
+in mind the limitations of common filesystems.  Many have severe
+length and character set restrictions.  Short alphanumeric filenames
+are least likely to require modification by the receiving system.
+
+The presence of the filename parameter does not force an
+implementation to write the entity to a separate file. It is
+perfectly acceptable for implementations to leave the entity as part
+of the normal mail stream unless the user requests otherwise. As a
+consequence, the parameter may be used on any MIME entity, even
+`inline' ones. These will not normally be written to files, but the
+parameter could be used to provide a filename if the receiving user
+should choose to write the part to a file.
+
+
+The Creation-Date parameter
+======================================================================
+The creation-date parameter MAY be used to indicate the date at which
+the file was created.  If this parameter is included, the paramter
+value MUST be a quoted-string which contains a representation of the
+creation date of the file in [RFC 822] `date-time' format.
+
+    quoted-date-time := quoted-string
+                     ; contents MUST be an RFC 822 `date-time'
+                     ; numeric timezones (+HHMM or -HHMM) MUST be used
+
+    quoted-string     = <"> *(qtext/quoted-pair) <">; Regular qtext or
+                                                    ;   quoted chars.
+
+    qtext             =  <any CHAR excepting <">,     ; => may be folded
+                           "\" & CR, and including
+                           linear-white-space>
+
+    quoted-pair       =  "\" CHAR                     ; may quote any char
+
+    date-time         =  [ day "," ] date time        ; dd mm yy
+                                                       ;  hh:mm:ss zzz
+           
+    day               =  "Mon"  / "Tue" /  "Wed"  / "Thu"
+                      /  "Fri"  / "Sat" /  "Sun"
+          
+    date              =  1*2DIGIT month 2DIGIT        ; day month year
+                                                      ;  e.g. 20 Jun 82
+          
+    month             =  "Jan"  /  "Feb" /  "Mar"  /  "Apr"
+                      /  "May"  /  "Jun" /  "Jul"  /  "Aug"
+                      /  "Sep"  /  "Oct" /  "Nov"  /  "Dec"
+          
+    time              =  hour zone                    ; ANSI and Military
+          
+    hour              =  2DIGIT ":" 2DIGIT [":" 2DIGIT]
+                                                      ; 00:00:00 - 23:59:59
+          
+    zone              =  "UT"  / "GMT"                ; Universal Time
+                                                      ; North American : UT
+                      /  "EST" / "EDT"                ;  Eastern:  - 5/ - 4
+                      /  "CST" / "CDT"                ;  Central:  - 6/ - 5
+                      /  "MST" / "MDT"                ;  Mountain: - 7/ - 6
+                      /  "PST" / "PDT"                ;  Pacific:  - 8/ - 7
+                      /  1ALPHA                       ; Military: Z = UT;
+                                                      ;  A:-1; (J not used)
+                                                      ;  M:-12; N:+1; Y:+12
+                      / ( ("+" / "-") 4DIGIT )        ; Local differential
+                                                      ;  hours+min. (HHMM)
+
+UNIX and POSIX implementors are cautioned that the `st_ctime' file
+attribute of the `stat' structure is not the creation time of the
+file; it is thus not appropriate as a source for the creation-date
+parameter value.
+
+
+The Modification-Date parameter
+======================================================================
+The modification-date parameter MAY be used to indicate the date at
+which the file was last modified.  If the modification-date parameter
+is included, the paramter value MUST be a quoted-string which
+contains a representation of the last modification date of the file
+in [RFC 822] `date-time' format.
+
+
+The Read-Date parameter
+======================================================================
+The read-date parameter MAY be used to indicate the date at which the
+file was last read.  If the read-date parameter is included, the
+parameter value MUST be a quoted-string which contains a
+representation of the last-read date of the file in [RFC 822] `date-
+time' format.
+
+
+The Size parameter
+======================================================================
+The size parameter indicates an approximate size of the file in
+octets.  It can be used, for example, to pre-allocate space before
+attempting to store the file, or to determine whether enough space
+exists.
+
+
+Unrecognized Disposition Types
+======================================================================
+Unrecognized parameters should be ignored. Unrecognized disposition
+types should be treated as `attachment'. The choice of `attachment'
+for unrecognized types is made because a sender who goes to the
+trouble of producing a Content-Disposition header with a new
+disposition type is more likely aiming for something more elaborate
+than inline presentation.
+
+Unless noted otherwise in the definition of a parameter, Content-
+Disposition parameters are valid for all dispositions.  (In contrast
+to MIME content-type parameters, which are defined on a per-content-
+type basis.) Thus, for example, the `filename' parameter still means
+the name of the file to which the part should be written, even if the
+disposition itself is unrecognized.
+
+
+Content-Disposition and Multipart
+======================================================================
+If a Content-Disposition header is used on a multipart body part, it
+applies to the multipart as a whole, not the individual subparts.
+The disposition types of the subparts do not need to be consulted
+until the multipart itself is presented.  When the multipart is
+displayed, then the dispositions of the subparts should be respected.
+
+If the `inline' disposition is used, the multipart should be
+displayed as normal; however, an `attachment' subpart should require
+action from the user to display.
+
+If the `attachment' disposition is used, presentation of the
+multipart should not proceed without explicit user action.  Once the
+user has chosen to display the multipart, the individual subpart
+dispositions should be consulted to determine how to present the
+subparts.
+
+
+Security Considerations
+======================================================================
+Since this memo provides a way for the sender to suggest a filename,
+a receiving implementation must take care that the sender's suggested filename
+does not represent a hazard. Using UNIX as an example, some hazards
+would be:
+    - Creating startup files (e.g., ".login").
+
+    - Creating or overwriting system files (e.g., "/etc/passwd").
+
+    - Overwriting any existing file.
+
+    - Placing executable files into any command search path
+      (e.g., "~/bin/more").
+
+    - Sending the file to a pipe (e.g., "| sh").
+
+In general, the receiving implementation should not name or place the file such
+that it will get interpreted or executed without the user explicitly
+initiating the action.
+
+It is very important to note that this is not an exhaustive list; it
+is intended as a small set of examples only.  Implementors must be
+alert to the potential hazards on their target systems.
+
+

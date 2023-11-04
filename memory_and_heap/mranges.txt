@@ -1,0 +1,125 @@
+============================================================================================================
+------------------------------------------------------------------------------------------------------------
+----------------------------------------------addrRange----------------------------------------------------
+------------------------------------------------------------------------------------------------------------
+============================================================================================================
+
+
+// addrRange represents a region of address space.
+//
+// An addrRange must never span a gap in the address space.
+type addrRange struct {
+	// base and limit together represent the region of address space
+	// [base, limit). That is, base is inclusive, limit is exclusive.
+	// These are address over an offset view of the address space on
+	// platforms with a segmented address space, that is, on platforms
+	// where arenaBaseOffset != 0.
+	base, limit offAddr
+}
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func makeAddrRange(base, limit uintptr) addrRange {}
+
+Creates a new address range from two virtual addresses.
+Throws if the base and limit are not in the same memory segment - not both in canonical user address space
+or not both in kernel address space.
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func (a addrRange) size() uintptr {}
+
+Returns the size of the range represented in bytes.
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func (a addrRange) contains(addr uintptr) bool {}
+
+Returns whether or not the range contains a given address.
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func (a addrRange) subtract(b addrRange) addrRange {}
+
+Takes the addrRange toPrune and cuts out any overlap with from, 
+then returns the new range. subtract assumes that a and b either don't overlap at all, 
+only overlap on one side, or are equal. If b is strictly contained in a, thus forcing a split, 
+it will throw:
+    - If 'a' and 'b' are equal returns an empty address space.
+
+    - If 'a' is strictly contained in 'b' returns an empty address space.
+
+    - If 'b' is strictly contained in 'a', thus forcing a split of 'a' into 2 parts, throws.
+
+    - If 'a' overlaps with 'b' from the left side, returns the right non-overlaping part of 'a'.
+
+    - If 'a' overlaps with 'b' from the right side, returns the left non-overlaping part of 'a'.
+
+
+
+
+
+
+============================================================================================================
+------------------------------------------------------------------------------------------------------------
+----------------------------------------------addrRanges----------------------------------------------------
+------------------------------------------------------------------------------------------------------------
+============================================================================================================
+
+
+// addrRanges is a data structure holding a collection of ranges of
+// address space.
+//
+// The ranges are coalesced eagerly to reduce the
+// number ranges it holds.
+//
+// The slice backing store for this field is persistentalloc'd
+// and thus there is no way to free it.
+//
+// addrRanges is not thread-safe.
+type addrRanges struct {
+	// ranges is a slice of ranges sorted by base.
+	ranges []addrRange
+
+	// totalBytes is the total amount of address space in bytes counted by
+	// this addrRanges.
+	totalBytes uintptr
+
+	// sysStat is the stat to track allocations by this type
+	sysStat *sysMemStat
+}
+
+
+------------------------------------------------------------------------------------------------------------
+
+func (a *addrRanges) init(sysStat *sysMemStat) {}
+
+Allocates an off-heap .ranges slice with an initial capacity to hold 16 addRange structs 
+and the length of 0.
+
+Sets .sysStat to the passed in sysStat and zeroes out .totalBytes count.
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+// findSucc returns the first index in a such that addr is
+// less than the base of the addrRange at that index.
+func (a *addrRanges) findSucc(addr uintptr) int {}
+
+If the .ranges slice has no elements, returns the 0 index.
+
+If the passed in addr is greater than all of the base addresses of addRanges contained 
+in the .ranges slice, returns the next index of the slice.
+
+Otherwise returns the index of the first addRange who's base is greater than the passed in addr (base)
+
+This is used to keep the .ranges slice sorted by base addresses of addRanges.

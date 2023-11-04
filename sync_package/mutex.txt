@@ -1,0 +1,139 @@
+-----------------------------------------------------------------------------------------------------
+TODO !!!!!!!!!!!!!!!!!!!!!!! REWRITE SOME EXPLANATIONS
+runtime/lock_futex.go
+func lock2(l *mutex) {}
+
+https://eli.thegreenplace.net/2018/basics-of-futexes/
+
+https://docs.kernel.org/locking/robust-futexes.html
+
+https://man7.org/linux/man-pages/man2/futex.2.html
+https://man7.org/linux/man-pages/man7/futex.7.html
+
+https://developpaper.com/read-the-semaphore-semaphore-source-code-in-go/
+
+
+
+`mutex` struct passed in is a struct that stores the lock's rank 
+and a pointer to the 32-bit futex word in its `.key` field.
+
+1) Gets a pointer to the currently running goroutine (`g` structure).
+
+2) Increments the `.locks` attribute of the thread M on which this goroutine is currently running.
+
+3) For the remaining part of the function it will implement futex based lock semantics described in linux API 
+   documentation:
+
+    To avoid switching to kernel space it will first try to use cheep atomic operations and spinlocks - 
+    the uncontended case happens more often than the contended case, no need to perform expensive system calls
+    and switch between user and kernel space right from the start.
+
+    1) Does an atomic exchange operation of the futex word pointed to by the `mutex.key` field
+       and the `mutex_locked` constant, if the old value returned by this operation is the
+       `mutex_unlocked` constant then it means that the mutex was unlocked and we successfully acquired
+       it (uncontended case), in this case the function just returns and the `mutex_locked` value is stored 
+       at the futex word. Otherwise the function proceeds.
+
+    2) Enters an infinite loop which starts with a spinlock pattern.
+       4 times in a row tries to atomically perform a compare-and-swap operation which
+       compares the currently stored value of the futex word pointed to by the `mutex.key` with the 
+       `mutex_unlocked` constant and if the comparison is true it means that the mutex was unlocked by some
+       other thread and we successfully acquired it. In this case the compare-and-swap operation 
+       stores the third passed in parameter at the futex word pointed to by the `mutex.key`. The third
+       parameter depends on the presult of the revious atomic exchange. If this thread was the only one 
+       trying to aqcuire the lock then the third parameter will be `mutex_locked` else it will be `mutex_sleeping`
+       meaning that some other thread or threads is trying to aqcuire the lock, so we need to restore this value
+       at the futex word to ensure that the sleeping thread or threads get their wakeup calls.
+       On successfull aqcuire the function returns.
+       If the atomic compare-and-swap operation returns false this means that the `mutex` is still
+       locked and a call to `procyield()` results in 30 cpu cycles spin lock (loop).
+       If during the 4 spinlocks the `mutex` is still locked the function continues.
+
+    3) Performs another compare-and-swap operation which does the same stuff as described
+       in the previous step, returns on success.
+       If the `mutex` is still locked a call to `osyield()` does a syscall which 
+       causes the calling thread to relinquish the CPU. The thread is moved to the end of 
+       the queue for its static priority and a new thread gets to run.
+       If the calling thread is the only thread in the highest priority list at that time, it will 
+       continue to run after a call to osyield().
+
+    4) Does an atomic exchange operation of the futex word pointed to by the `mutex.key` field
+       and the `mutex_sleeping` constant, if the old value returned by this operation is the
+      `mutex_unlocked` constant then it means that the mutex was unlocked 
+      and we successfully acquired it. Otherwise the function preceeds.
+      In both case `mutex_sleeping` is stored in the futex word.
+      atomic.Xchg(key32(&l.key), mutex_sleeping) - TODO!!!!!! WHY IN BOTH CASES?
+    5) The value of the third parameter for the compare-and-swap operation is set to `mutex_sleeping`
+       for the next iteration of the infinite loop.
+
+    6) Calls the futex() system call FUTEX_WAIT_PRIVATE command and a -1 timeout which means 
+      "block indefintely" until a FUTEX_WAKE unblocks this thread.
+      The futex() sys call in this configuration means that the kernel will block this thread
+      only if futex word's value is still set to `mutex_sleeping` which was set in step 4.
+      The futex() call) as the expected value of the futex word. The loading of the futex word's value, 
+      the comparison of that value with the expected value, and the actual blocking will happen
+      atomically and will be totally ordered with respect to concurrent operations performed by other 
+      threads on the same futex word. If the futex value does not match `mutex_sleeping`, then the call fails
+      immediately with the error EAGAIN.
+      The purpose of the comparison with the expected value is to prevent lost wake-ups.  
+      If another thread changed the value of the futex word after the calling thread decided
+      to block based on the prior value, and if the other thread executed a FUTEX_WAKE operation 
+      (or similar wake-up) after the value change and before this FUTEX_WAIT operation,
+      then the calling thread will observe the value change and will not start to sleep.
+      The FUTEX_WAIT_PRIVATE invariation of FUTEX_WAIT tells the kernel that the futex is process-private and
+      not shared with another process (i.e., it is being used for synchronization only between threads 
+      of the same process).  This allows the kernel to make some additional performance optimizations.
+
+   7) After the thread is woken up by a FUTEX_WAKE operation in some other thread it enters the infinite
+      loop once again because it may be not the only waiter that was woken up so it needs to perform
+      the atomic compare-and-swap operations and maybe even futex() calls all over again 
+      until it finally aqcuires the mutex.
+   
+
+
+-------------------------------------------------------------------------------------------------------
+runtime/asm_amd64.s
+func procyield(cycles uint32) {} 
+
+Implemented in assembly, doesn't use stack space, basically is a spinlock.
+
+1) Keeps looping for `cycles`, each cycle takes up one cpu clock cycle
+   with a predefined delay. The Pentium 4 and Intel Xeon processors implement 
+   the PAUSE instruction as a pre-defined delay. 
+   The delay is finite and can be zero for some processors. 
+   This instruction does not change the architectural state of the processor 
+   (that is, it performs essentially a delaying noop operation)
+
+Why use spinlocks:
+SpinLocks are the ones in which thread waits till the lock is available. 
+This will normally be used to avoid overhead of obtaining the kernel objects when there
+is a scope of acquiring the kernel object within some small time period.
+
+When you use regular locks (mutexes, critical sections etc), operating system puts your thread 
+in the WAIT state and preempts it by scheduling other threads on the same core. 
+This has a performance penalty if the wait time is really short, 
+because your thread now has to wait for a preemption to receive CPU time again.
+
+Spinlocks don't cause preemption but wait in a loop ("spin") till the other core releases the lock. 
+This prevents the thread from losing its quantum and continue as soon as the lock gets released. 
+
+Spinlocks are only useful in places where anticipated waiting time is shorter 
+than a quantum (read: milliseconds) and preemption doesn't make much sense.
+
+If waiting time is unknown Spinlocks aren't efficient. 
+You consume 100% CPU time on the waiting core while checking if a spinlock is available. 
+You prevent other threads from running on that core till your quantum expires. 
+This scenario is only feasible for short bursts.
+
+
+-------------------------------------------------------------------------------------------------------
+runtime/sys_linux_amd64.s
+func osyield() {}
+
+Implemented in assembly, doesn't use stack space, basically consists of a single syscall 
+that causes the calling thread to relinquish the CPU.
+
+1) sched_yield() causes the calling thread to relinquish the CPU.
+   The thread is moved to the end of the queue for its static priority and a new thread gets to run.
+   If the calling thread is the only thread in the highest priority list at that time, it will 
+   continue to run after a call to osyield().

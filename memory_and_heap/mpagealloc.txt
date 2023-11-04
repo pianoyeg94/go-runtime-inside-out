@@ -1,0 +1,913 @@
+Page allocator.
+The page allocator manages mapped pages (defined by pageSize, NOT
+physPageSize) for allocation and re-use. It is embedded into mheap.
+Pages are managed using a bitmap that is sharded into chunks.
+In the bitmap, 1 means in-use, and 0 means free. The bitmap spans the
+process's address space. Chunks are managed in a sparse-array-style structure
+similar to mheap.arenas, since the bitmap may be large on some systems.
+The bitmap is efficiently searched by using a radix tree in combination
+with fast bit-wise intrinsics. Allocation is performed using an address-ordered
+first-fit approach.
+
+Each entry in the radix tree is a summary that describes three properties of
+a particular region of the address space: the number of contiguous free pages
+at the start and end of the region it represents, and the maximum number of
+contiguous free pages found anywhere in that region.
+
+Each level of the radix tree is stored as one contiguous array, which represents
+a different granularity of subdivision of the processes' address space. Thus, this
+radix tree is actually implicit in these large arrays, as opposed to having explicit
+dynamically-allocated pointer-based node structures. Naturally, these arrays may be
+quite large for system with large address spaces, so in these cases they are mapped
+into memory as needed. The leaf summaries of the tree correspond to a bitmap chunk.
+The root level (referred to as L0 and index 0 in pageAlloc.summary) has each
+summary represent the largest section of address space (16 GiB on 64-bit systems),
+with each subsequent level representing successively smaller subsections until we
+reach the finest granularity at the leaves, a chunk.
+
+More specifically, each summary in each level (except for leaf summaries)
+represents some number of entries in the following level. For example, each
+summary in the root level may represent a 16 GiB region of address space,
+and in the next level there could be 8 corresponding entries which represent 2
+GiB subsections of that 16 GiB region, each of which could correspond to 8
+entries in the next level which each represent 256 MiB regions, and so on.
+Thus, this design only scales to heaps so large, but can always be extended to
+larger heaps by simply adding levels to the radix tree, which mostly costs
+additional virtual address space. The choice of managing large arrays also means
+that a large amount of virtual address space may be reserved by the runtime.
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func addrsToSummaryRange(level int, base, limit uintptr) (lo int, hi int) {}
+
+Converts base and limit pointers into a range of entries (indices into the slice of summaries) 
+for the given summary level.
+
+The returned range is inclusive on the lower bound and exclusive on the upper bound.
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func blockAlignSummaryRange(level int, lo, hi int) (int, int) {}
+
+Aligns indices into the given level to that level's block width (1 << levelBits[level]).
+It assumes lo is inclusive and hi is exclusive, and so aligns them down and up respectively.
+
+All of the levels except level 0 should be aligned by blocks of 8 summary entries.
+Level zero is aligned by a block of 16384 summary entries - the whole level, this means that 
+level 0 consists only of 1 block which has 16384 summary entries.
+
+
+
+
+
+
+============================================================================================================
+------------------------------------------------------------------------------------------------------------
+----------------------------------------------pageAlloc-----------------------------------------------------
+------------------------------------------------------------------------------------------------------------
+============================================================================================================
+
+
+type pageAlloc struct {
+	// Radix tree of summaries.
+	//
+	// Each slice's cap represents the whole memory reservation.
+	// Each slice's len reflects the allocator's maximum known
+	// mapped heap address for that level.
+	//
+	// The backing store of each summary level is reserved in init
+	// and may or may not be committed in grow (small address spaces
+	// may commit all the memory in init).
+	//
+	// The purpose of keeping len <= cap is to enforce bounds checks
+	// on the top end of the slice so that instead of an unknown
+	// runtime segmentation fault, we get a much friendlier out-of-bounds
+	// error.
+	//
+	// To iterate over a summary level, use inUse to determine which ranges
+	// are currently available. Otherwise one might try to access
+	// memory which is only Reserved which may result in a hard fault.
+	//
+	// We may still get segmentation faults < len since some of that
+	// memory may not be committed yet.
+	summary [summaryLevels][]pallocSum
+
+	// chunks is a slice of bitmap chunks.
+	//
+	// The total size of chunks is quite large on most 64-bit platforms
+	// (O(GiB) or more) if flattened, so rather than making one large mapping
+	// (which has problems on some platforms, even when PROT_NONE) we use a
+	// two-level sparse array approach similar to the arena index in mheap.
+	//
+	// To find the chunk containing a memory address `a`, do:
+	//   chunkOf(chunkIndex(a))
+	//
+	// Below is a table describing the configuration for chunks for various
+	// heapAddrBits supported by the runtime.
+	//
+	// heapAddrBits | L1 Bits | L2 Bits | L2 Entry Size
+	// ------------------------------------------------
+	// 32           | 0       | 10      | 128 KiB
+	// 33 (iOS)     | 0       | 11      | 256 KiB
+	// 48           | 13      | 13      | 1 MiB
+	//
+	// There's no reason to use the L1 part of chunks on 32-bit, the
+	// address space is small so the L2 is small. For platforms with a
+	// 48-bit address space, we pick the L1 such that the L2 is 1 MiB
+	// in size, which is a good balance between low granularity without
+	// making the impact on BSS too high (note the L1 is stored directly
+	// in pageAlloc).
+	//
+	// To iterate over the bitmap, use inUse to determine which ranges
+	// are currently available. Otherwise one might iterate over unused
+	// ranges.
+	//
+	// Protected by mheapLock.
+	//
+	// TODO(mknyszek): Consider changing the definition of the bitmap
+	// such that 1 means free and 0 means in-use so that summaries and
+	// the bitmaps align better on zero-values.
+	chunks [1 << pallocChunksL1Bits]*[1 << pallocChunksL2Bits]pallocData
+
+	// The address to start an allocation search with. It must never
+	// point to any memory that is not contained in inUse, i.e.
+	// inUse.contains(searchAddr.addr()) must always be true. The one
+	// exception to this rule is that it may take on the value of
+	// maxOffAddr to indicate that the heap is exhausted.
+	//
+	// We guarantee that all valid heap addresses below this value
+	// are allocated and not worth searching.
+	searchAddr offAddr
+
+	// start and end represent the chunk indices
+	// which pageAlloc knows about. It assumes
+	// chunks in the range [start, end) are
+	// currently ready to use.
+	start, end chunkIdx
+
+	// inUse is a slice of ranges of address space which are
+	// known by the page allocator to be currently in-use (passed
+	// to grow).
+	//
+	// This field is currently unused on 32-bit architectures but
+	// is harmless to track. We care much more about having a
+	// contiguous heap in these cases and take additional measures
+	// to ensure that, so in nearly all cases this should have just
+	// 1 element.
+	//
+	// All access is protected by the mheapLock.
+	inUse addrRanges
+
+	_ uint32 // Align scav so it's easier to reason about alignment within scav.
+
+	// scav stores the scavenger state.
+	scav struct {
+		// index is an efficient index of chunks that have pages available to
+		// scavenge.
+		index scavengeIndex
+
+		// released is the amount of memory released this generation.
+		//
+		// Updated atomically.
+		released uintptr
+
+		_ uint32 // Align assistTime for atomics on 32-bit platforms.
+
+		// scavengeAssistTime is the time spent scavenging in the last GC cycle.
+		//
+		// This is reset once a GC cycle ends.
+		assistTime atomic.Int64
+	}
+
+	// mheap_.lock. This level of indirection makes it possible
+	// to test pageAlloc indepedently of the runtime allocator.
+	mheapLock *mutex
+
+	// sysStat is the runtime memstat to update when new system
+	// memory is committed by the pageAlloc for allocation metadata.
+	sysStat *sysMemStat
+
+	// summaryMappedReady is the number of bytes mapped in the Ready state
+	// in the summary structure. Used only for testing currently.
+	//
+	// Protected by mheapLock.
+	summaryMappedReady uintptr
+
+	// Whether or not this struct is being used in tests.
+	test bool
+}
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func (p *pageAlloc) init(mheapLock *mutex, sysStat *sysMemStat) {}
+
+
+TODO!!!!!!!!!!!!!!!!!! if levelLogPages[0] > logMaxPackedValue {}
+
+1) Saves sysStat in pageAlloc's .sysStat attribute, which is the runtime memstat 
+   to update when new system memory is committed by the pageAlloc for allocation metadata.
+
+2) Initializes the .inUse addrRanges object, which is a slice of ranges of address space which are
+   known by the page allocator to be currently in-use. Initializiation consists of 
+   allocating an off-heap .inUse.ranges slice with an initial capacity to hold 16 addRange structs 
+   and the length of 0. Also zeroes out .inUse.totalBytes count.
+
+3) Reserves an appropriate amount of off-heap memory for each of the 5 page summary levels of the radix tree.
+   Each level is wrapped in a slice with capacity set to the amount of reserved memory, meaning that at first 
+   each slice isn't backed by any memory at all. Each memory reservation is a no protocol anonymous private mmaping 
+   located anywhere in the address space.
+   TODO!!!!!!!!!!!!!!!!!! How and when will be the memory commited?
+
+4) TODO!!!!!!!!!!!!!!!!!! Set up the scavenge index
+
+5) Assigns pageAlloc's .searchAddr attribute to the maximum positive canonical 
+   address within then x86_64 address space (0x00007fffffffffff).
+   TODO!!!!!!!!!!!!!!!!!! why is 0x00007fffffffffff chosen as the initial value?
+
+TODO!!!!!!!!!!!!!!!!!! sysStat
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func (p *pageAlloc) grow(base, size uintptr) {}
+
+// grow sets up the metadata for the address range [base, base+size).
+// It may allocate metadata, in which case *p.sysStat will be updated.
+//
+// p.mheapLock must be held.
+
+TODO!!!!!!!!!!!!!!!!!! is used after allocating an arena to update the pages bitmap and summaries?
+
+Alligns the base and upper address of the allocation to be on a multiple of 4MB stride from the 
+starting offset address, because each bitmap chunk is responsible for 4MB 
+of address space. TODO!!!!!!!!!!!!!!!!!! Why if arena is already alligned on 4MB?
+
+Walks down the summaries radix tree and computes indices into each level which are responsible for
+the address range passed in. The indices are alligned to be on the boundary of an 8-entry stride
+through the current level. This holds true for all levels except level 0, which is itself a single stride 
+of 16384 entries (whole level). TODO!!!!!!!!!!!!!!!!!! this compliments the `(p *pageAlloc) find()` method and its 
+max per-level iteration of `1 << levelBits[l]`?
+
+Indices for [base, base+size) addresses are calculated by first converting them from offset addresses to addresses 
+in a linear address space and using their specific bits as indices into levels of the radix tree:
+	Level 0: the first 14 higher-order bits 
+	Level 1: the first 17 higher-order bits
+	Level 2: the first 20 higher-order bits
+	Level 3: the first 23 higher-order bits
+	Level 4: the first 26 higher-order bits
+
+The length of each level is updated if the resulting limit index is greater than the previous length 
+(slices backing each level usually remain sparse).
+
+This index range is converted to an address range aligned by physical page size (4KB) and is supposed to be backing 
+the entries at the current tree level. The resulting range represents a fraction of a previously reserved 
+memory chunk per level.
+
+Before commiting, the resulting reserved address range may be pruned from either sides to avoid remmaping of already
+mapped addresses. This is achieved by looking at already in use address ranges and pruning any overlaps.
+It may be so, that we do not need to commit any memory at all to support an index range within a particular level.
+
+The resulting chunk of memory is commited for each level. Level 0's backing reserved memory is only commited once 
+and in whole on first growth. TODO!!!!!!!!!!!!!!!!!! sysUsed
+
+The new offset address range is added to the inUse slice which is sorted by base addresses.
+
+--------------------
+
+pallocChunkPages = 512 // number of pages for which a single bitmap chunk is responsible for 
+                       // (a chunk is an array of 8 uint64s)
+
+pallocChunkBytes = 4MB // a single bitmap chunk is responsible for 4MB of memory
+
+The bitmap is a 2-dimensional array of pointers to arrays consiting of chunks which are themselves 
+8-element arrays (pallocData.pageBits). The first level consists of 8192 pointers to arrays.
+Each level 2 array holds 8192 bitmap chunks. 
+
+The first 13 high-order bits of a global index into the bitmap represent the index into the 1st level array.
+
+The last 13 low-order bits of a global index into the bitmap represent the index into one of the level 2 arrays.
+
+start and end represent the chunk indices which pageAlloc knows about. 
+It assumes chunks in the range [start, end) are currently ready to use.
+
+--------------------
+
+If this is the first growth of pageAlloc or the base address of the allocated range is represented
+by a lower index into the bitmap, updates .start to be this new index.
+The .end index is also updated if the ending address of the allocated range is represented by a higher
+index into the bitmap than already know. Those are also indices into the leaf level of the 
+radix tree of summaries. TODO!!!!!!!!!!!!!!!!!! how are start and end values used?
+
+If the new memory chunk ends up bellow .searchAddress, update .searchAddress to be the base
+address of the freshly allocated chunk, so that searching starts 
+from this address. TODO!!!!!!!!!!!!!!!!!! how is .searchAddress used?
+
+Allocates off-heap level 2 arrays in the bitmap if necessary, which are needed to store the bitmap chunks
+representing the fresh allocation.
+
+TODO!!!!!!!!!!!!!!!!!! Newly-grown memory is always considered scavenged.
+	                   Set all the bits in the scavenged bitmaps high.
+
+--------------------
+
+logMaxPackedValue = 21
+
+maxPackedValue = 1 << 21 = 2097152
+
+// Each entry in the radix tree is a summary that describes three properties of
+// a particular region of the address space: the number of contiguous free pages
+// at the start and end of the region it represents, and the maximum number of
+// contiguous free pages found anywhere in that region.
+
+---------------------
+
+TODO!!!!!!!!!!!!!!!!!! p.update(base, size/pageSize, true, false) for more details
+Walks up the radix tree of summaries and updates the summary range corresponding to the allocation at each level.
+
+TODO!!!!!!!!!!!!!!!!!!
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func (p *pageAlloc) update(base, npages uintptr, contig, alloc bool) {}
+
+Updates heap metadata. It must be called each time the bitmap is updated.
+If contig is true, update does some optimizations assuming that there was
+a contiguous allocation or free between addr and addr+npages. alloc indicates
+whether the operation performed was an allocation or a free.
+
+If the allocation spans a single bitmap chunk, updates the corresponding summary in the radix tree's leaf level. 
+If the offset address range aligns directly on a single bitmap chunk, then summary's start, max and end will  
+be equal to 512, signifying that the corresponding bitmap chunk represents 512 pages that are free. Otherwise 
+previous allocations may be taken into account.
+
+If the passed in offset address range is a contiguous run of pages that spans accross multiple bitmap chunks,
+then only the leaf summaries representing the start and end of the range should be recalculated - the offset address 
+range may well start and end on pages somewhere in the midst of a bitmap chunk and thus not align by the right and 
+left-most summaries. 
+If `alloc` is false, the summaries in between will have start, max and end equal to 512, signifying that each 
+corresponding bitmap chunk represents 512 pages that are free.
+Otherwise all the in between summaries are set to zero, signifying that all the bitmap chunks are fully allocated.
+
+If the allocation spans more then one bitmap chunk but isn't contiguos then the leaf summaries that correspond
+to the offset address range are all recalculated.
+
+For each level:
+	Derives from the offset address range the summary indices for that level. 
+
+--------------------
+
+// levelLogPages is log2 the maximum number of runtime pages in the address space
+// a summary in the given level represents.
+//
+// The leaf level always represents exactly log2 of 1 chunk's worth of pages.
+
+logPallocChunkPages = 9 - is the base 2 logarithm of 512, the size of a bitmap chunk.
+
+	A single level 0 summary is responsible for: 2097152 pages, which is levelLogPages[0] = 21
+	A single level 1 summary is responsible for: 262144 pages, which is levelLogPages[1] = 18
+	A single level 2 summary is responsible for: 32768 pages, which is levelLogPages[2] = 15
+	A single level 3 summary is responsible for: 4096 pages, which is levelLogPages[3] = 12
+	A single level 4 summary is responsible for: 512 pages, which is levelLogPages[4] = 9
+
+--------------------
+
+TODO!!!!!!!!!!!!!!!!!! Walks up the radix tree and updates summaries
+
+TODO!!!!!!!!!!!!!!!!!!
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func (p *pageAlloc) find(npages uintptr) (uintptr, offAddr) {}
+
+// arenaBaseOffset = 0xffff800000000000
+
+	// minOffAddr = 0xffff800000000000
+
+	// maxOffAddr = 0x00007fffffffffff
+
+	// npages = 4 pages
+
+	// searchAddr = 0x000000c00010c000
+
+	// 0x000000c00010c000 + 4 pages = 0x000000c000113fff
+
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// LEVEL 0
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// =====================================================================================================================
+
+	// i := 0
+	// entriesPerBlock := 16384
+	// logMaxPages := 21
+
+	// entries := p.summary[0][0:16384] // the whole level 0 slice
+
+	// j0 := 0
+
+	// offAddrToLevelIndex:
+	// 		linearSearchAddr = (0x000000c00010c000 - 0xffff800000000000) = 000080c00010c000
+	//      searchIdx = 0x000080c00010c000 >> 34 = 8240
+
+	//      8240 &^ 16383
+	// 			 ^16383 is '0b00000000000000' (14 0 bits)
+	//            8240 holds 14 bits of value
+
+	//      searchIdx&^(entriesPerBlock-1) = 0 = i
+	// j0 = 8240
+
+	// var base, size uint
+	// for j = 8240; j < 16384; j++ {}
+	// entries[8240] == 0  => size = 0
+	// entries[8241] != 0 => We've encountered a non-zero summary which means free memory, so update firstFree.
+
+	// levelIndexToOffAddr(0, 8241):
+	//    uintptr(idx) = 8241
+	//    levelShift[level] = 34
+	//    linear address = uintptr(8241) << 34 = 0x000080c400000000
+	//    uintptr(0x000080c400000000) + 0xffff800000000000 =
+	//     0000000000000000100000001100010000000000000000000000000000000000
+	//     ---------------------------------------------------------------- +
+	//     1111111111111111100000000000000000000000000000000000000000000000
+	//     ================================================================
+	//     0000000000000000000000001100010000000000000000000000000000000000
+	//
+	//     = offAddr{0x000000c400000000}
+
+	// levelIndexToOffAddr(0, 8241) = offAddr{0x000000c400000000}
+
+	// a summary for this level is responsible for 16GB of memory
+
+	// foundFree(offAddr{0x000000c400000000}, 16GiB):
+	//    0x000000c400000000 + 16GiB fit into the original base and bound anddresses of the firstFree structure
+	//    so now:
+	//    	firstFree.base = offAddr{0x000000c400000000}
+	//      firstFree.limit= offAddr{0x000000c7ffffffff}
+
+	// ====================================================================================================
+	// If there's a required number of pages at the start of the summary the search will stop at this level
+	// =====================================================================================================
+	// s := sum.start()            // get number of free pages at the start of the summary
+	// s := 1024
+	// if 1024 > 4 {
+	//  If size == 0 we don't have a run yet,
+	//  which means base isn't valid. So, set
+	//  base to the first page in this block.
+	// 	if size == 0 {
+	// 	base = uint(j) << logMaxPages // set base offset address of chunk
+	//  base = 8241 << logMaxPages - this gives us the base byte-addresable address of our chunk of memory
+	//      where there're 1024 free pags at the start of the chunk
+	//
+	//  base = 0x0000000406200000
+	//  }
+	//
+	//  // We hit npages; we're done!
+	//  size += s // size will now countain the number of pages at the start of the summary
+	//  size = 1024
+	//  break from for j := j0; j < len(entries); j++ {} stride throuth the 0th level
+	//
+	// Next (TODO!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!):
+	//   // We found a sufficiently large run of free pages straddling
+	//   // some boundary, so compute the address and return it.
+	//   addr := levelIndexToOffAddr(l, i).add(uintptr(base) * pageSize).addr()
+	//   return addr, p.findMappedAddr(firstFree.base)
+	// }
+
+	// ====================================================================================================
+	// If there's not enough pages at the start of the summary, but the maximum is enough, proceed to next
+	// lower level
+	// =====================================================================================================
+	// if sum.max() >= uint(npages) {} - somewhere in the middle there's enough pages
+	// // The entry itself contains npages contiguous
+	// // free pages, so continue on the next level
+	// // to find that run.
+	// i += j = 8241
+	// lastSumIdx = i = 8241
+	// lastSum = sum = summary at 8241 in level 0
+	// continue nextLevel (to level 1)
+
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// LEVEL 1
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// i = 65928
+	//
+	// // lastSum is the summary which we saw on the previous level that made us
+	// // move on to the next level. Used to print additional information in the
+	// // case of a catastrophic failure.
+	// // lastSumIdx is that summary's index in the previous level.
+	// lastSum = summary at index 8241 in level 0's array
+	// lastSumIdx = 8241
+	// entriesPerBlock := 8
+	// logMaxPages := 18
+	// entries := p.summary[1][65928:65936] - 8 children of parent level 0 summary starting at index 65928 in level 1 ,
+	//                                        each is responsible for 2GiB of address space
+	//
+	// j0 := 0
+	//
+	// offAddrToLevelIndex:
+	// 		linearSearchAddr = (0x000000c00010c000 - 0xffff800000000000) = 000080c00010c000
+	//      searchIdx = 0x000080c00010c000 >> 31 = 65920
+	//
+	//      65920 &^ (8 -1)
+	// 			 ^7 is '0b000' (3 zero bits)
+	//            65920 holds 17 bits of value
+	//
+	//      determine if searchIdx fits into our candidate block at the current level p.summary[1][65928:65936]
+	//      if it would we could eliminate for example iteration through indexes 65928 - 65932, and start right
+	//      away from 65933
+	//      searchIdx&^(entriesPerBlock-1) = 65920 != i (65928)
+	// j0 = 0
+	//
+	// var base, size uint
+	// for j = 0; j < 8; j++ {}
+	// entries[65928] == 0  => size = 0
+	// entries[65929] != 0 => We've encountered a non-zero summary which means free memory, so update firstFree.
+	//
+	// levelIndexToOffAddr(1, 65929):
+	//    uintptr(idx) = 65929
+	//    levelShift[level] = 31
+	//    linear address = uintptr(65929) << 31 = 0x000080c480000000
+	//
+	//     uintptr(0x000080c480000000) + 0xffff800000000000 =
+	//     00000000000000100000001100010010000000000000000000000000000000
+	//     -------------------------------------------------------------- +
+	//     11111111111111110000000000000000000000000000000000000000000000
+	//     ==============================================================
+	//     00000000000000010000001100010010000000000000000000000000000000
+	//
+	//     = offAddr{0x000040c480000000}
+	//
+	// levelIndexToOffAddr(1, 65929) = offAddr{0x000040c480000000}
+	//
+	// foundFree(offAddr{0x000040c480000000}, 2GiB):
+	//    0x000040c480000000 + 2GiB fit into the previous base (offAddr{0x000000c400000000})
+	//    and bound (offAddr{0x000000c7ffffffff}) addresses of the firstFree structure updated in level 0 so now:
+	//    firstFree.base =  offAddr{0x000040c480000000}
+	//    firstFree.limit = offAddr{0x000040c4ffffffff}
+	//
+	// s := sum.start() = 0
+	// if sum.max() >= uint(npages) {
+	// 	  // The entry itself contains npages contiguous
+	// 	  // free pages, so continue on the next level
+	// 	  // to find that run.
+	// 	  i += j = 65929
+	// 	  lastSumIdx = 65929
+	// 	  lastSum = p.summary[1][65929]
+	// 	  continue nextLevel
+	// }
+
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// LEVEL 2
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// i = 527432
+	//
+	// // lastSum is the summary which we saw on the previous level that made us
+	// // move on to the next level. Used to print additional information in the
+	// // case of a catastrophic failure.
+	// // lastSumIdx is that summary's index in the previous level.
+	// lastSum = summary at index 65929 in level 1's array
+	// lastSumIdx = 65929
+	// entriesPerBlock := 8
+	// logMaxPages := 15
+	// entries := p.summary[2][527432:527440] - 8 children of parent level 1 summary starting at index 527432 in level 2 ,
+	//                                          each is responsible for 256MiB of address space
+	//
+	// j0 := 0
+	//
+	// offAddrToLevelIndex:
+	// 		linearSearchAddr = (0x000000c00010c000 - 0xffff800000000000) = 000080c00010c000
+	//      searchIdx = 0x000080c00010c000 >> 28 = 527360
+	//
+	//      527360 &^ (8 -1)
+	// 			 ^7 is '0b000' (3 zero bits)
+	//            527360 holds 22 bits of value
+	//
+	//      determine if searchIdx fits into our candidate block at the current level p.summary[2][527432:527440]
+	//      if it would we could eliminate for example iteration through indexes 527432 - 527439, and start right
+	//      away from 527435
+	//      searchIdx&^(entriesPerBlock-1) = 527360 != i (527432)
+	//
+	// j0 = 0
+	//
+	// // var base, size uint
+	// for j = 0; j < 8; j++ {}
+	// entries[527432] == 0  => size = 0
+	// entries[527433] == 0  => size = 0
+	// entries[527434] != 0 => We've encountered a non-zero summary which means free memory, so update firstFree.
+	//
+	// levelIndexToOffAddr(2, 527434):
+	//    uintptr(idx) = 527434
+	//    levelShift[level] = 28
+	//    linear address = uintptr(527434) << 28 = 0x000080c4a0000000
+	//
+	//     uintptr(0x000080c4a0000000) + 0xffff800000000000 =
+	//     00000000000000100000001100010010100000000000000000000000000000
+	//     -------------------------------------------------------------- +
+	//     11111111111111110000000000000000000000000000000000000000000000
+	//     ==============================================================
+	//     00000000000000010000001100010010100000000000000000000000000000
+	//
+	//     = offAddr{0x000000c4a0000000}
+	//
+	// levelIndexToOffAddr(2, 527434) = offAddr{0x000000c4a0000000}
+	//
+	// foundFree(offAddr{0x000040c4a0000000}, 256MiB):
+	//    0x000040c4a0000000 + 256MiB fit into the previous base (offAddr{offAddr{0x000000c480000000})
+	//    and bound (offAddr{0x000000c7ffffffff}) addresses of the firstFree structure updated in level 1 so now:
+	//    firstFree.base =  offAddr{0x000000c4a0000000}
+	//    firstFree.limit = offAddr{0x000000c4afff757f}
+	//
+	// // s := sum.start() = 0
+	// if sum.max() >= uint(npages) {
+	// 	  // The entry itself contains npages contiguous
+	// 	  // free pages, so continue on the next level
+	// 	  // to find that run.
+	// 	  i += j = 527434
+	// 	  lastSumIdx = 527434
+	// 	  lastSum = p.summary[2][527434]
+	// 	  continue nextLevel
+	// }
+
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// LEVEL 3
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// i = 4219472
+	//
+	// // lastSum is the summary which we saw on the previous level that made us
+	// // move on to the next level. Used to print additional information in the
+	// // case of a catastrophic failure.
+	// // lastSumIdx is that summary's index in the previous level.
+	// lastSum = summary at index 527434 in level 2's array
+	// lastSumIdx = 527434
+	// entriesPerBlock := 8
+	// logMaxPages := 12
+	// entries := p.summary[2][4219472:4219480] - 8 children of parent level 2 summary starting at index 4219472 in level 3,
+	//                                            each is responsible for 32MiB of address space
+	//
+	// j0 := 0
+	//
+	// offAddrToLevelIndex:
+	// 		linearSearchAddr = (0x000000c00010c000 - 0xffff800000000000) = 000080c00010c000
+	//      searchIdx = 0x000080c00010c000 >> 25 = 4218880
+	//
+	//      4218880 &^ (8 -1)
+	// 			 ^7 is '0b000' (3 zero bits)
+	//            4218880 holds 23 bits of value
+	//
+	//      determine if searchIdx fits into our candidate block at the current level p.summary[2][527432:527440]
+	//      if it would we could eliminate for example iteration through indexes 527432 - 527439, and start right
+	//      away from 527435
+	//      searchIdx&^(entriesPerBlock-1) = 4218880 != i (4219472)
+	//
+	// j0 = 0
+	//
+	// // // var base, size uint
+	// for j = 0; j < 8; j++ {}
+	// entries[4219472:4219478] == 0  => size = 0
+	// entries[4219479] != 0 => We've encountered a non-zero summary which means free memory, so update firstFree.
+	//
+	// levelIndexToOffAddr(3, 4219479):
+	//    uintptr(idx) = 4219479
+	//    levelShift[level] = 25
+	//    linear address = uintptr(4219479) << 25 = 0x000080c4ae000000
+	//
+	//     uintptr(0x000080c4ae000000) + 0xffff800000000000 =
+	//     00000000000000100000001100010010101110000000000000000000000000
+	//     -------------------------------------------------------------- +
+	//     11111111111111110000000000000000000000000000000000000000000000
+	//     ==============================================================
+	//     00000000000000010000001100010010101110000000000000000000000000
+	//
+	//     = offAddr{0x000000c4ae000000}
+	//
+	//
+	// levelIndexToOffAddr(3, 4219479) = offAddr{0x000000c4ae000000}
+	//
+	// foundFree(offAddr{0x000000c4ae000000}, 16GiB):
+	//    0x000000c4ae000000 + 16GiB - 1 fit into the previous base (offAddr{0x000000c4ae000000})
+	//    and bound (offAddr{0x000040c4afff757f}) addresses of the firstFree structure updated in level 2 so now:
+	//    firstFree.base =  offAddr{0x000000c4ae000000}
+	//    firstFree.limit = offAddr{0x000000c4afffffff}
+	//
+	// // s := sum.start() = 0
+	// if sum.max() >= uint(npages) {
+	// 	  // The entry itself contains npages contiguous
+	// 	  // free pages, so continue on the next level
+	// 	  // to find that run.
+	// 	  i += j = 4219479
+	// 	  lastSumIdx = 4219479
+	// 	  lastSum = p.summary[3][4219479]
+	// 	  continue nextLevel
+	// }
+
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// LEVEL 4 (last level)
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// i = 33755832
+	//
+	// // lastSum is the summary which we saw on the previous level that made us
+	// // move on to the next level. Used to print additional information in the
+	// // case of a catastrophic failure.
+	// // lastSumIdx is that summary's index in the previous level.
+	// lastSum = summary at index 4219479 in level 3's array
+	// lastSumIdx = 4219479
+	// entriesPerBlock := 8
+	// logMaxPages := 9 (512 pages)
+	// entries := p.summary[2][33755832:33755840] - 8 children of parent level 3 summary starting at index 33755832 in level 4,
+	//                                              each is responsible for 4MiB of address space
+	//
+	// j0 := 0
+	//
+	// offAddrToLevelIndex:
+	// 		linearSearchAddr = (0x000000c00010c000 - 0xffff800000000000) = 000080c00010c000
+	//      searchIdx = 0x000080c00010c000 >> 22 = 33751040
+	//
+	//      33751040 &^ (8 -1)
+	// 			 ^7 is '0b000' (3 zero bits)
+	//            33751040 holds 28 bits of value (3 low-order bits are zero), so searchIdx&^(entriesPerBlock-1)
+	//            doesn't change the searchIdx, it remains 33751040
+	//
+	//      determine if searchIdx fits into our candidate block at the current level p.summary[2][527432:527440]
+	//      if it would we could eliminate for example iteration through indexes 527432 - 527439, and start right
+	//      away from 527435
+	//      searchIdx&^(entriesPerBlock-1) = 33751040 != i (33755832)
+	//
+	// j0 = 0
+	//
+	// // // var base, size uint
+	// for j = 0; j < 8; j++ {}
+	// entries[33755832] != 0 => We've encountered a non-zero summary which means free memory, so update firstFree.
+	//
+	// levelIndexToOffAddr(4, 33755832):
+	//    uintptr(idx) = 33755832
+	//    levelShift[level] = 22
+	//    linear address = uintptr(33755832) << 22 = 0x000080c4ae000000
+	//
+	//    uintptr(0x000080c4ae000000) + 0xffff800000000000 =
+	//    0000000000000000100000001100010010101110000000000000000000000000
+	//    ----------------------------------------------------------------- +
+	//    1111111111111111100000000000000000000000000000000000000000000000
+	//    ================================================================
+	//    0000000000000000000000001100010010101110000000000000000000000000
+	//
+	//     = offAddr{0x000000c4ae000000}
+	//
+	//
+	// levelIndexToOffAddr(4, 33755832) = offAddr{0x000000c4ae000000}
+	//
+	// foundFree(offAddr{0x000000c4ae000000}, 4MiB):
+	//    0x000040c4ae000000 + (2147483648 - 1) fit into the previous base (offAddr{0x000000c4ae000000})
+	//    and bound (offAddr{0x000040c8adffffff}) addresses of the firstFree structure updated in level 3 so now:
+	//    firstFree.base =  offAddr{0x000000c4ae000000}
+	//    firstFree.limit = offAddr{0x000000c4ae3fffff}
+	//    firstFree.base => firstFree.limit = 4MiB, 512 pages, 1 bitmap chunk
+	//
+	// s := sum.start()
+	// if size+s >= uint(npages) {} = false
+	//
+	// if sum.max() >= uint(npages) {} = true
+	//     i += j = 33755832 + 0 = 33755832
+	//     lastSumIdx = 33755832
+	//     lastSum = p.summary[4][33755832]
+	//     continue nextLevel
+	//
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// Levels exhausted, found summary at last level with a sufficient run of pages somewhere in the middle of 1 bitmap chunk
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// =====================================================================================================================
+	// This means the last summary we inspected must have had a large enough "max"
+	// value, so look inside the chunk to find a suitable run.
+	//
+	// Since we've gotten to this point, that means we haven't found a
+	// sufficiently-sized free region straddling some boundary (chunk or larger).
+	// This means the last summary we inspected must have had a large enough "max"
+	// value, so look inside the chunk to find a suitable run.
+	//
+	// After iterating over all levels, i must contain a chunk index which
+	// is what the final level represents.
+	// ci := chunkIdx(i) = chunkIdx(33755832)
+	// j, searchIdx := p.chunkOf(ci).find(npages, 0) = p.chunkOf(33755832).find(4, 0)
+	// p.chunkOf(33755832):
+	//     ci.l1() = 33755832.l1():
+	//         return uint(i) >> pallocChunksL1Shift = 33755832 >> 13 = 4120
+	//
+	//    return &p.chunks[4120][ci.l2()]
+	//
+	//    ci.l1() = 33755832.l2():
+	//         return uint(i) & (1<<pallocChunksL2Bits - 1) = 33755832 & 8191 = 4792
+	//
+	//    return &p.chunks[4120][4792]
+	//
+	// j, searchIdx := p.chunkOf(ci).find(npages, 0) = &p.chunks[4120][4792].find(4, 0)
+	//
+	// j - is the start index at which at least a conitguos run of 4 free pages is found within the bitmap chunk, for example 127
+	// searchIdx - is the index at which the first free page within the bitmap chunk is found, will narrow down the next search within
+	//             the same bitmap chunk, for example 14
+	//
+	//
+	// // Compute the address at which the free space starts.
+	// addr := chunkBase(ci) + uintptr(j)*pageSize
+	//
+	// chunkBase(ci chunkIdx) uintptr {
+	//		return uintptr(ci)*pallocChunkBytes + arenaBaseOffset
+	//      33755832 * 4MiB = 141582221180928 = 0x000080c4ae000000 (address in linear address space, offset from 0 = around 128TiB)
+	//      covert to Linux segmented virtual address space = uintptr(0x000080c4ae000000) + 0xffff800000000000 = 0x000000c4ae000000 = 0xc4ae000000
+	// }
+	//
+	// chunkBase(33755832) =0x000000c4ae000000
+	//
+	// addr := 0x000000c4ae000000 + (127 * 8192) = 0x000000c4ae0fe000
+	//
+	// // Since we actually searched the chunk, we may have
+	// // found an even narrower free window.
+	// searchAddr := chunkBase(ci) + uintptr(searchIdx)*pageSize
+	// searchAddr := 0x000000c4ae000000 + (14 * 8192) = 0x000000c4ae01c000
+	//
+	// foundFree(offAddr{searchAddr}, chunkBase(ci+1)-searchAddr)
+	// foundFree(offAddr{0x000000c4ae01c000}, 0x000000c4ae400000 - 0x000000c4ae01c000)
+	// foundFree(offAddr{0x000000c4ae01c000}, 4079616 bytes):
+	// 		0x000000c4ae01c000 + (4079616 - 1) fit into the previous base (offAddr{0x000000c4ae000000})
+	//    and bound (offAddr{0x000000c4ae3fffff}) addresses of the firstFree structure updated in level 4 so now:
+	//    firstFree.base =  offAddr{0x000000c4ae01c000}
+	//    firstFree.limit = offAddr{0x000000c4ae3fffff}
+	//    firstFree.base => firstFree.limit = 4079616 bytes, 498 pages, 14th page in the current bitmap chunk
+	//
+	// return uintptr(0x000000c4ae0fe000), p.findMappedAddr(firstFree.base)
+	//
+	//
+	// CASE `if size == 0 || s < 1<<logMaxPages {}` within the `for j := j0; j < len(entries); j++ {}` loop
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+type pallocSum uint64
+
+pallocSum is a packed summary type which packs three numbers: start, max,
+and end into a single 8-byte value. Each of these values are a summary of
+a bitmap and are thus counts, each of which may have a maximum value of
+2^21 - 1, or all three may be equal to 2^21. The latter case is represented
+by just setting the 64th bit.
+
+Describes three properties of a particular region of the address space: the number 
+of contiguous free pages at the start and end of the region it represents, and the maximum 
+number of contiguous free pages found anywhere in that region.
+
+The first high-order bit with other bits set to 0 is used to indicated that a particular region of 
+the address space consists of pages that are all free.
+
+Starting from the 2nd high-order bit:
+	- The first 21 high-order bits represent the number of contiguous free pages at the start of an address region
+
+	- The middle 21 bits represent the maximum number of contiguous free pages found anywhere in an address region
+
+	- The last 21 low-order bits represent the number of contiguous free pages at the end of an address region
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func packPallocSum(start, max, end uint) pallocSum {}
+
+Takes a start, max, and end value and produces a pallocSum where starting from the 2nd high-order bit:
+	- The first 21 high-order bits represent start
+
+	- The middle 21 bits represent max
+
+	- The last 21 low-order bits represent end
+
+If max is equal to maxPackedValue, then the produced packPallocSum will be represented by just setting the 64th bit, 
+which means that an address space consists of pages that are all free.
+

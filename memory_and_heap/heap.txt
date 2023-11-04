@@ -1,0 +1,650 @@
+https://deepu.tech/memory-management-in-golang/
+https://medium.com/@ankur_anand/a-visual-guide-to-golang-memory-allocator-from-ground-up-e132258453ed
+https://povilasv.me/go-scheduler/
+
+https://faculty.etsu.edu/TARNOFF/ntes4717/week_04/RAM_8_by_11.pdf
+https://www.techtarget.com/searchstorage/definition/RAM-random-access-memory
+https://doc.lagout.org/Computer%20Organisation%20%26%20Fundementals.pdf
+https://www.techtarget.com/searchstorage/definitions
+
+http://goog-perftools.sourceforge.net/doc/tcmalloc.html
+
+https://www.altoros.com/blog/golang-internals-part-6-bootstrapping-and-memory-allocator-initialization/
+
+/src/runtime/mheap.go
+/src/runtime/malloc.go
+/src/runtime/mfixalloc.go
+/src/runtime/mem_linux.go
+
+Definition: data line
+An individual circuit, or line, that carries data within a computer or communications channel.
+
+A treap is a data structure which combines binary tree and binary heap 
+(hence the name: tree + heap Treap). More specifically, treap is a data structure 
+that stores pairs in a binary tree in such a way that it is a binary search tree 
+by and a binary heap by .
+
+
+heapAddrBits is the number of bits in a heap address. 
+On amd64, addresses are sign-extended beyond heapAddrBits. On
+other arches, they are zero-extended.
+
+On most 64-bit platforms, we limit this to 48 bits based on a
+combination of hardware and OS limitations.
+
+amd64 hardware limits addresses to 48 bits, sign-extended
+to 64 bits. Addresses where the top 16 bits are not either
+all 0 or all 1 are "non-canonical" and invalid. Because of
+these "negative" addresses, we offset addresses by 1<<47
+(arenaBaseOffset) on amd64 before computing indexes into
+the heap arenas index. In 2017, amd64 hardware added
+support for 57 bit addresses; however, currently only Linux
+supports this extension and the kernel will never choose an
+address above 1<<47 unless mmap is called with a hint
+address above 1<<47 (which we never do).
+
+
+
+============================================================================================================
+------------------------------------------------------------------------------------------------------------
+----------------------------------------------mheap---------------------------------------------------------
+------------------------------------------------------------------------------------------------------------
+============================================================================================================
+
+
+mspan size on 64 bit platforms = 160 byte
+mspan objects reside in of heap memory managed by fixalloc
+
+
+------------------------------------------------------------------------------------------------------------
+
+mheap.init()
+
+// Initialize the heap.
+func (h *mheap) init() {}
+
+Initializes 2 lock with ranks lockRankMheap and lockRankMheapSpecial TODO!!!!!!!!!!!!!!!!!!.
+
+
+
+
+
+
+============================================================================================================
+------------------------------------------------------------------------------------------------------------
+----------------------------------------------mpagealloc----------------------------------------------------
+------------------------------------------------------------------------------------------------------------
+============================================================================================================
+
+TODO!!!!!!!!!!!!!!!!!!
+
+PROT_NONE allocates a contiguous virtual memory region with no permissions granted.
+
+This can be useful, as other have mentioned, to implement guards 
+(pages that on touch cause segfaults, both for bug hunting and security purposes) 
+or "magic" pointers where values within a PROT_NONE mapping are to be interpreted 
+as something other than a pointer.
+
+Another use is when an application wishes to map multiple independent mappings as 
+a virtually contiguous mapping. This would be done by first mmapping a large enough 
+chunk with PROT_NONE, and then performing other mmap calls with the MAP_FIXED flag 
+and an address set within the region of the PROT_NONE mapping 
+(the use of MAP_FIXED automatically unmaps part of mappings that are being "overridden").
+
+PROT_NONE
+This flag must be specified on its own.
+
+The memory is reserved, but cannot be read, written, or executed. If this flag is 
+specified in a call to mmap, a virtual memory area will be set aside for future use 
+in the process, and mmap calls without the MAP_FIXED flag will not use it for subsequent 
+allocations. For anonymous mappings, the kernel will not reserve any physical memory for 
+the allocation at the time the mapping is created.
+
+OpenJDK ... uses PROT_NONE mappings to reserve uncommitted address space (which is then committed with mprotect calls, as needed).
+
+The natural assumption is that it wishes to have contiguous heap memory for some reason.
+
+It uses PROT_NONE to reserve space, until it actually needs it. The original context of 
+this comment is a discussion about Linux VM overcommit: using unaccessible mappings 
+avoids requiring any commitment from the kernel (until the mapping is needed 
+& made accessible), in case the kernel is configure for strict commit mode.
+
+If you're wondering why it needs to make this reservation in advance in the context of 
+the JVM, consider that native code linked in using JNI or equivalent might also 
+be using mmap.
+
+
+------------------------------------------------------------------------------------------------------------
+
+pallocSum
+
+type pallocSum uint64
+
+logMaxPackedValue = 21
+
+maxPackedValue = 2097152
+
+Is a packed summary type which packs three numbers: start, max, and end into a 
+single 8-byte value. 
+start, end and max describe three properties of a particular region of the address space: 
+   the number of contiguous free pages at the start and end of the region it represents, 
+   and the maximum number of contiguous free pages found anywhere in that region.
+Each of these values are a summary of a bitmap and are thus counts, each of which may have 
+a maximum value of 2^21 - 1, or all three may be equal to 2^21. The latter case is 
+represented by just setting the 64th bit.
+
+
+
+
+
+
+
+============================================================================================================
+------------------------------------------------------------------------------------------------------------
+----------------------------------------------fixalloc------------------------------------------------------
+------------------------------------------------------------------------------------------------------------
+============================================================================================================
+
+/src/runtime/mfixalloc.go
+
+TODO !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+_FixAllocChunk = 16384 bytes // (16Kb) max chunk size for fixalloc
+
+Is a second-level proxy to the runtime's globally accessible persistentChunks off heap linked 
+list of mmaped and prefaulted 256Kb memory chunks. Sits on top of a persistentalloc 
+first-level proxy.
+
+persitentalloc first-level proxies come in 2 flavors:
+   - per-p to avoid lock contention when allocating new chunks to the persistentChunks list
+
+   - one globally accessible and locked when we run without a P
+
+The first-level proxy is responsible for asking the OS for more memory, filling the 
+persistentChunks list with new chunks and handing out blocks of memory from the list.
+
+Allocates from a free-list of objects which are inserted when free() is called.
+
+Allocates and claims ownership of ~16Kb chunks from persistentChunks through a persistentalloc
+first-level proxy to use them for fixed-size allocations.
+
+A per-p or a single globally accessible persistentalloc only owns a single 256Kb chunk at any point 
+in time and fulfills allocation requests TODO!!!!!!!!!!!!!!!!!! 
+
+Is a second-level proxy to the runtime's globally accessible persistentChunks linked list.
+This list holds 256Kb off heap non-GC mmaped and prefaulted memory chunks. Each chunk from 
+the list is owned at maximum by one of the per-p or a single globally accessible persistentalloc 
+first-level proxy. 
+
+Is a second-level proxy to the runtime's globally accessible persistentChunks linked list, 
+which sits on top of one of the per-p or a single global persistentalloc first-level proxy.
+The persistentChunks list holds 256Kb off heap non-GC mmaped and prefaulted memory chunks. Each chunk
+is managed by a per-p or globally accessible persistentalloc first-level proxy.
+
+Provides a fixed size property to the allocation process on top of the persistentalloc 
+first-level proxy, which carries out lock-free per-p or globally locked allocation procedures 
+from the persistentChunks linked list together with the actual mmaping of prefaulted memory 
+chunks into the list.
+
+Both proxies only communicate with one chunk at a time until it gets exhausted.
+The persistentalloc first-level per-p or global proxy only own a chunk
+
+Uses a free-list off fixed size
+
+On first alloc gets a ~16Kb chunk through the persistentalloc proxy which owns one of the 256Kb chunks from persistentChunks, this may result in asking the OS for more memory if persistentalloc's
+active
+from the currently active 256Kb block used by a  persistentalloc persistentalloc persistentChunks  
+
+TODO!!!!!!!!!!!!!!!!!!
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+fixalloc.init()
+
+func (f *fixalloc) init(
+    size uintptr, 
+    first func(arg, p unsafe.Pointer), 
+    arg unsafe.Pointer, 
+    stat *sysMemStat,
+) {}
+
+1) If someone tries to initialize the allocator to allocate more than 16384 byte chunks,
+   a panic will be thrown ("runtime: fixalloc size too large").
+
+2) If someone tries to initialize the allocator to allocate less than word size 
+   chunks (8 or 4 bytes) then the allocator rounds the size up to 64 or 32 bits.
+
+3) Stores size and other attributes TODO!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+4) f.nalloc - uint32(16384 / 16382 * 16382) == 16382, uint32(16384 / 1000 * 1000) == 16000
+   TODO!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+fixalloc.alloc()
+
+func (f *fixalloc) alloc() unsafe.Pointer {}
+
+1) If this method is called on a non-initialized instance of fixalloc, a panic is thrown.
+
+2) If chunk list empty / not empty: TODO!!!!!!!!!!!!!!!!!!
+    1. Empty:
+
+
+
+Allocates fixed size objects (memory blocks) from a cache, the cache isn't part of 
+go's heap and the object size is determined at initialization time.
+
+Uses ~16Kb memory chunks allocated from the runtime's off heap persitent chunks linked list 
+as its object allocation cache.
+New allocations happen from the active chunk which is currently considered to be the head of the list.
+The size of a single chunk is rounded down from 16Kb to be a multiple of object size. 
+
+If it's the first time a fixalloc is asked to allocate from it's cache or the fixed size 
+object isn't going to fit in fixalloc's active memory chunk, a new ~16Kb off heap chunk 
+is requested from one of the runtime's pesistent alloc's (global or per-p).
+
+This could also result in physical memory allocation if the persistent alloc isn't
+able to fit the requested ~16Kb in it's 256Kb active memory chunk (mmaps a new prefaulted 
+chunk). Check out malloc.go:persistentalloc for more details.
+
+TODO!!!!!!!!!!!!!!!!!! (if f.list != nil {})
+
+
+
+
+
+
+============================================================================================================
+------------------------------------------------------------------------------------------------------------
+-----------------------------------------malloc.go----------------------------------------------------------
+------------------------------------------------------------------------------------------------------------
+============================================================================================================
+
+
+src/runtime/malloc.go
+
+
+------------------------------------------------------------------------------------------------------------
+
+persistentalloc()
+
+// Wrapper around sysAlloc that can allocate small chunks.
+// There is no associated free operation.
+// Intended for things like function/type/debug-related persistent data.
+// If align is 0, uses default align (currently 8).
+// The returned memory will be zeroed.
+// sysStat must be non-nil.
+//
+// Consider marking persistentalloc'd types go:notinheap.
+func persistentalloc(size, align uintptr, sysStat *sysMemStat) unsafe.Pointer {}
+
+Calls persistentalloc1 on the system stack and returns a pointer to the starting
+address of the resulting allocation.
+
+For more details check out persistentalloc1.
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+persistentalloc1()
+
+// Must run on system stack because stack growth can (re)invoke it.
+// See issue 9174.
+//go:systemstack
+func persistentalloc1(size, align uintptr, sysStat *sysMemStat) *notInHeap {}
+
+TODO!!!!!!!!!!!!!!!!!! (is responsible for allocating memory that's not garbage collected?)
+
+persistentChunkSize:
+   persistentalloc1 asks the OS for more memory in chunks of 256Kb, so that
+   each call doesn't result in switching to kernel land, which in this case would 
+   also result in physical allocation of memory.
+
+pesistentChunks 
+TODO!!!!!!!!!!!!!!!!!! (are these chunks somehow freed/deleted by the runtime?): 
+   Is a globally accessible linked list of prefaulted mmaped memory chunks that 
+   were allocated since the runtime started. 
+   Each pesistent chunk in the list is 256Kb in size and points to the previously 
+   mmaped chunk through its first word.
+   This linked list is updated atomically.
+   Global and per-p persistentAllocs caches own the chunks within this list.
+
+persistentAlloc:
+   Is an object that represrents an off heap memory chunk which is usually 256Kb in size.
+   Includes a pointer to the chunk's starting address.
+   Includes an offset to be used for the next allocation within the chunk.
+
+globalAlloc:
+   Is an object which globally accessible by the runtime.
+   Is guarded by a mutex and points to a prefaulted off heap chunk of memory used
+   for runtime object allocations.
+   Each P also has a similar local cache to avoid lock contention.
+
+The align parameter of this function is used for mechanical sympathy so that allocations
+can be efficiently aligned within a single memory chunk. 
+A panic is thrown if align is not a power of 2 or is greater than 8Kb. 
+By default an align of 8 bytes is chosen.
+
+If the size of the requested allocation is greater than or equal to 64Kb, directly mmaps 
+a prefaulted chunk of memory and returns its starting address to the caller. 
+TODO!!!!!!!!!!!!!!!!!! (SysAlloc + sys stat + soft memory limit details)
+
+Before allocating from an active chunk of memory or asking the OS for a new chunk,
+the requested alignment is performed.
+
+If the calling goroutine is running within an M attached to a P 
+the per-p persistentAlloc cache will be used for allocation, otherwise globalAlloc 
+will be used instead.
+
+If it's the first off heap allocation ever made since the runtime started or 
+if the requested allocation doesn't fit into the remaining free space within 
+the current chunk, a new 256Kb prefaulted memory chunk will be mmaped and will 
+take its place as the current active chunk for allocating.
+This new chunk will become the head of the globally accessible persistentChunks
+linked list.
+
+The actuall allocation just shifts the offset within the active memory chunk 
+by the requested allocation size and returns a pointer to the previous 
+offset (aligned), indicating the starting address of the requested allocation.
+The pointer will slice into a per-p persistent allocation cache or the globally
+accessible one.
+
+
+
+
+
+
+============================================================================================================
+------------------------------------------------------------------------------------------------------------
+-----------------------------------------mem_linux.go-------------------------------------------------------
+------------------------------------------------------------------------------------------------------------
+============================================================================================================
+
+
+src/runtime/mem_linux.go
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+sysAllocOS()
+
+// Don't split the stack as this method may be invoked without a valid G, which
+// prevents us from allocating more stack.
+//go:nosplit
+func sysAlloc(n uintptr, sysStat *sysMemStat) unsafe.Pointer {}
+
+1) Mmaps an anonymous contiguous chunk of prefaulted virtual memory of the requested size 
+   private to the current process available for reading and writing.
+   Prefaulted - means that the whole chunk is already backed up by physical memory,
+   the pages are guaranteed to stay in RAM until munmap is called, preventing 
+   the memory from being paged to the swap area.
+
+2) If mmap returns the EAGAIN error code it means that some or all of the OS-chosen 
+   address ranges could not be locked into RAM. In this case we exit the process immediately.
+
+3) If mmap returns the EACCES error code it means that for some reason access was denied.
+   In this case we exit the process immediately.
+
+4) If some other error occured, a nil pointer is returned immediately indicating that no
+   memory was allocated and thus no start address is available.
+
+5) Adds the zize of the mmaped chunk to runtime memory statistics
+   TODO !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 
+
+6) Returns an unsafe pointer the starting address of the mmaped chunk.
+
+
+
+
+
+
+============================================================================================================
+------------------------------------------------------------------------------------------------------------
+----------------------------------------------pageAlloc-----------------------------------------------------
+------------------------------------------------------------------------------------------------------------
+============================================================================================================
+
+
+
+============================================================================================================
+------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------
+============================================================================================================
+
+pallocChunkPages = 512 - A single chunk of the bitmap can hold information about 512 pages. 
+
+A single chunk of the bitmap is a uint64 array of size 8, it means it contains
+512 bits to hold 512 pages.
+This array is type aliased as pageBits.
+
+logPallocChunkPages = 9 - is the base 2 logarithm of 512, the size of a bitmap chunk.
+
+pallocChunkBytes = 4194304 = 4MB  - for how much memory is a 
+single chunk of the bitmap responsible.
+
+logPallocChunkBytes = 22 - is the base 2 logarithm of 4194304, bytes of memory for which a single
+bitmap chunk is responsible for.
+
+// pallocChunksL2Bits is the number of bits of the chunk index number
+// covered by the second level of the chunks map.
+//
+// See (*pageAlloc).chunks for more details. Update the documentation
+// there should this change.
+pallocChunksL2Bits = 13
+pallocChunksL1Shift = pallocChunksL2Bits = 13
+
+.chunks is a 2-dimensional array of pointers to arrays holding pallocData structs which hold pageBits
+
+.chunks first level array has 8192 elements (8192 of pointers to arrays).
+Basically the first level array of .chunks is 8KB in size
+pallocChunksL1Bits = 13 - each index into the .chunks first level array can be represented
+by 13 bits (together 8192 elements and array of the same size)
+
+48 bit intel addresses can address 256 Terabytes of address space, .chunks represents those 256 Terabytes
+(128 terabytes of user space and 128 terabytes of kernel space)
+
+arenaBaseOffset = 0xffff800000000000 = 18446603336221196288 (the address of where the kernel virtual memory 
+                                      starts, user space virtual-memory (canonical) spans from 
+                                      0000_0000_0000_0000 to 0000_7fff_ffff_ffff)
+
+The 64-bit x86 virtual memory map splits the address space into two: the lower section 
+(with the top bit set to 0) is user-space, the upper section (with the top bit set to 1) is kernel-space.
+(Note that x86-64 defines “canonical” “lower half” and “higher half” addresses, with a number of bits 
+effectively limited to 48 or 57
+
+heapAddrBits = 48 
+
+summaryLevels = 5
+
+summaryLevelBits = 3
+
+summaryL0Bits = heapAddrBits - logPallocChunkBytes - (summaryLevels-1)*summaryLevelBits = 14
+
+maxOffAddr = offAddr{(281474976710655 + arenaBaseOffset) & uintptrMask} = 140737488355327
+
+uintptrMask = 18446744073709551615
+
+https://unix.stackexchange.com/questions/509607/how-a-64-bit-process-virtual-address-space-is-divided-in-linux
+https://www.kernel.org/doc/html/latest/x86/x86_64/mm.html
+
+
+// levelLogPages is log2 the maximum number of runtime pages in the address space
+// a summary in the given level represents.
+//
+// The leaf level always represents exactly log2 of 1 chunk's worth of pages.
+levelLogPages = 
+Zeroth level - a single pallocSum element in the first level slice is responsible for 16GB of address space.
+              This is 2097152 pages and 4096 bitmap chunks which are responsible for them.
+First level - 2GB. This is 262144 pages and 512 bitmap chunks which are responsible for them.
+Second level - 256MB. This is 32768 pages and 64 bitmap chunks which are responsible for them.
+Thrid level - 32MB. This is 4096 pages and 8 bitmap chunks which are responsible for them.
+Fourth level - 4MB. (512 pages, represents a single chunk of the bitmap)
+
+Zeroth level of the summary (radix tree) has 16384 pallocSum entries to represent 256 TiB of virtual
+address space. Each pallocSum is responsible for 16GB of memory.
+
+// minOffAddr is the minimum address in the offset space, and
+// it corresponds to the virtual address arenaBaseOffset.
+minOffAddr = offAddr{arenaBaseOffset} = 0xffff800000000000
+
+// maxOffAddr is the maximum address in the offset address
+// space. It corresponds to the highest virtual address representable
+// by the page alloc chunk and heap arena maps.
+maxOffAddr = 0x00007fffffffffff = 140737488355327
+
+Raw value of arenaBaseOffset = 18446603336221196288
+
+Maybe: 
+   The address space spans from 0xffff800000000000 (-140737488355328) 
+   to 0x00007fffffffffff (140737488355327).
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func (p *pageAlloc) find(npages uintptr) (uintptr, offAddr) {}
+
+On lvl0 iterates at most all of the pallocSum entries of the level array (16384). 
+On lvl1 through lvl4 iterates at most 8 pallocSum entries of each level array.
+
+At each level uses pallocSum entries to find either:
+   1) That a given subtree contains a large enough contiguous region for npages, 
+      at which point it continues iterating on the next level, or
+   
+   2) That there are enough contiguous boundary-crossing bits (pages) to satisfy
+      the allocation, at which point it knows exactly where to start 
+      allocating from.
+
+i := 0 is the beginning of the block of entries we're searching at the
+current level.
+
+firstFree is the region of address space that we are certain to find the first 
+free page in the heap. base and bound are the inclusive bounds of this window, 
+and both are addresses in the linearized, contiguous view of the address space 
+(with arenaBaseOffset pre-added). At each level, this window is narrowed as we 
+find the memory region containing the first free page of memory.
+To begin with, the range reflects the full process address space.
+firstFree is updated by calling foundFree each time free space in the
+heap is discovered.
+At the end of the search, base.addr() is the best new searchAddr we could 
+deduce in this search.
+
+foundFree takes the given address range [addr, addr+size) and updates firstFree 
+if it is a narrower range. The input range must either be fully contained 
+within firstFree or not overlap with it at all.
+This way, we'll record the first summary we find with any free pages 
+on the root level and narrow that down if we descend into that summary. But as soon 
+as we need to iterate beyond that summary in a level to find a large enough range, 
+we'll stop narrowing.
+
+(uintptr(1)<<logMaxPages)*pageSize = 16GB
+
+
+
+At level0 with no memory previously allocated:
+   entriesPerBlock = 16384
+
+   p.searchAddr = maxOffAddr = 0x00007fffffffffff = 140737488355327
+
+   firstFree.base = minOffAddr = arenaBaseOffset = 0xffff800000000000 = two's compliment -140737488355328 =
+      raw value 18446603336221196288
+
+   levelShift[0] = 34
+
+   lvl0 pallocSum number = 16384
+
+   j0 = 16383 (last pallocSum entry in l0)
+
+   i+j = 16383
+   
+
+For example, at level 1 the summary just before the last one will be 
+
+// On most 64-bit platforms, we limit this to 48 bits based on a
+// combination of hardware and OS limitations.
+//
+// amd64 hardware limits addresses to 48 bits, sign-extended
+// to 64 bits. Addresses where the top 16 bits are not either
+// all 0 or all 1 are "non-canonical" and invalid. Because of
+// these "negative" addresses, we offset addresses by 1<<47
+// (arenaBaseOffset) on amd64 before computing indexes into
+// the heap arenas index. In 2017, amd64 hardware added
+// support for 57 bit addresses; however, currently only Linux
+// supports this extension and the kernel will never choose an
+// address above 1<<47 unless mmap is called with a hint
+// address above 1<<47 (which we never do).
+
+// arenaBaseOffset is the pointer value that corresponds to
+// index 0 in the heap arena map.
+//
+// On amd64, the address space is 48 bits, sign extended to 64
+// bits. This offset lets us handle "negative" addresses (or
+// high addresses if viewed as unsigned).
+
+https://www.kernel.org/doc/html/latest/x86/x86_64/mm.html
+
+
+
+
+1) heapAddrBits = 48
+
+2) arenaBaseOffset = minOffAddr = 0xffff800000000000 = 
+      1111111111111111100000000000000000000000000000000000000000000000 (64 bit, 17 ones + 47 zeroes)
+3) maxOffAddr = (((1 << heapAddrBits) - 1) + arenaBaseOffset) & uintptrMask 
+
+   Basically means highest 64 bit virtual address (or the most negative one which is 128TiB away from 0)
+
+   (1 << heapAddrBits) - 1 = 0x0000ffffffffffff = 
+      0000000000000000111111111111111111111111111111111111111111111111 (64bit, 48 ones)
+      
+
+   arenaBaseOffset = 0xffff800000000000
+      1111111111111111100000000000000000000000000000000000000000000000
+
+   ((1 << heapAddrBits) - 1) + arenaBaseOffset = 0x00007fffffffffff
+      0000000000000000011111111111111111111111111111111111111111111111
+
+   uintptrMask = 
+      1111111111111111111111111111111111111111111111111111111111111111
+
+
+   ((1 << heapAddrBits) - 1) : 48 bits max addr value or -128 TB
+
+
+
+A tebibyte (TiB) equals nearly 1.1 TB
+
+
+
+0xc0000000018088
+
+0000000000000000000000001100000000000000000000011000000010001000    0x00c0000000018088
+---------------------------------------------------------------- -                     -
+1111111111111111100000000000000000000000000000000000000000000000    0xffff800000000000
+================================================================
+0000000000000000100000001100000000000000000000011000000010001000    
+---------------------------------------------------------------- >>
+8240
+
+
+0000000000000000011111111111111111111111111111111111111111111111    0x00007fffffffffff
+---------------------------------------------------------------- -                     -
+1111111111111111100000000000000000000000000000000000000000000000    0xffff800000000000
+================================================================ =
+0000000000000000111111111111111111111111111111111111111111111111 
+---------------------------------------------------------------- >> 
+16383
+
+
+
+https://simonis.github.io/Memory/
+
+https://en.wikipedia.org/wiki/X86-64#Virtual_address_space_details

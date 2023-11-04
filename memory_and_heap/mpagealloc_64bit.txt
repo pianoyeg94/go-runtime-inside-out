@@ -1,0 +1,80 @@
+============================================================================================================
+------------------------------------------------------------------------------------------------------------
+----------------------------------------------pageAlloc-----------------------------------------------------
+------------------------------------------------------------------------------------------------------------
+============================================================================================================
+
+Radix tree of summaries per level entries count:
+    Level 0 = 16384
+    Level 1 = 131072
+    Level 2 = 1048576
+    Level 3 = 8388608
+    Level 4 = 67108864
+
+Virtual memory to reseve for each level of the radix tree (physical page allignment included):
+    Level 0 = 128KB (32 4KB physical OS pages)
+    Level 1 = 1MB   (256 4KB physical OS pages)
+    Level 2 = 8MB   (2048 4KB physical OS pages)
+    Level 3 = 64MB  (16384 4KB physical OS pages)
+    Level 4 = 512MB (131072 4KB physical OS pages) 
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+// sysInit performs architecture-dependent initialization of fields
+// in pageAlloc. pageAlloc should be uninitialized except for sysStat
+// if any runtime statistic should be updated.
+func (p *pageAlloc) sysInit() {}
+
+Reservers memory for each level of the radix tree of summaries. 
+(currently those are level 0 through 4).
+TODO!!!!!!!!!!!!!!!!!! This will get mapped in as R/W by setArenas.
+
+TODO!!!!!!!!!!!!!!!!!! add more details about the radix tree of summaries 
+
+TODO!!!!!!!!!!!!!!!!!! Set up the scavenge index
+
+TODO!!!!!!!!!!!!!!!!!! How and when will be the memory commited?
+
+Reserves the appropriate amount of off-heap memory for each of the 5 page summary levels 
+of the radix tree.
+
+Each level is wrapped in a slice with capacity set to the amount of reserved memory, 
+meaning that at first each slice isn't backed by any memory at all.
+
+Each memory reservation is a no protocol anonymous private mmaping located 
+anywhere in the address space.
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+// sysGrow performs architecture-dependent operations on heap
+// growth for the page allocator, such as mapping in new memory
+// for summaries. It also updates the length of the slices in
+// [.summary.
+//
+// base is the base of the newly-added heap memory and limit is
+// the first address past the end of the newly-added heap memory.
+// Both must be aligned to pallocChunkBytes.
+//
+// The caller must update p.start and p.end after calling sysGrow.
+func (p *pageAlloc) sysGrow(base, limit uintptr) {}
+
+First of all computes the index at which the new address range should be inserted into the .inUse slice 
+so that it remains sorted by the base addresses of the ranges contained in it. 
+This slice is a list of address ranges, which are currently mapped and available for allocation.
+This index is used to prune overlapping memory while mmaping new summaries in.
+
+Walks down the radix tree and commits reserved memory, which is required to hold the summaries 
+for the new address range. 
+
+This involves finding out the required summary range at each level, updating the slice length with the new upper bound 
+and computing the virtual address range at which the backing memory of the summaries was previously reserved. 
+To avoid remapping of already mapped memory the resulting address range is checked against already mapped summaries and 
+if they overlap, the range is pruned. At the end we might find out that the required memory is already mapped.
+
+The indexes are alligned to accomodate a stride of 8 elements from the start of the level.
+Their underlying reserved memory is alligned by physical page size.
+
