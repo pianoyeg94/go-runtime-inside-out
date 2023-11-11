@@ -108,7 +108,6 @@ func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason w
 	releasem(mp)
 	// can't do anything that might move the G between Ms here.
 	mcall(park_m) // never returns, saves this G's exeuction context and switches to g0 stack to call the passed in function
-
 }
 
 func goready(gp *g, traceskip int) {

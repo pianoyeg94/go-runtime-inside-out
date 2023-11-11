@@ -1,141 +1,123 @@
-The central concept of the epoll API is the epoll instance, an
-       in-kernel data structure which, from a user-space perspective,
-       can be considered as a container for two lists:
+ListenTCP() from src/net/tcpsock.go is called by Listen() from src/net/dial.go.
 
-       • The interest list (sometimes also called the epoll set): the
-         set of file descriptors that the process has registered an
-         interest in monitoring.
+(sl *sysListener) listenTCPProto() is called by ListenTCP() from src/net/tcpsock.go
+(sd *sysDialer) dialTCP() is called by Dial() and DialContext() from src/net/dial.go
 
-       • The ready list: the set of file descriptors that are "ready"
-         for I/O.  The ready list is a subset of (or, more precisely, a
-         set of references to) the file descriptors in the interest
-         list.  The ready list is dynamically populated by the kernel as
-         a result of I/O activity on those file descriptors.
+(sl *sysListener) listenTCPProto() is called by (sl *sysListener) listenTCP()
+(sd *sysDialer) doDialTCPProto() is called by (sd *sysDialer) dialTCP()
 
+src/net/ipsock_posix.go:internetSocket is called by src/net/tspsock_posix.go (sl *sysListener) listenTCPProto() or
+                                                                             (sd *sysDialer) doDialTCPProto()
 
-------------------------------------------------------------------------------------------------------------
+src/net/sock_posix.go:socket is called by src/net/ipsock_posix.go:internetSocket
 
+When the first socket is created by a go program the following happens (socket function from src/net/sock_posix.go):
 
-The runtime system considers an unsafe.Pointer as a reference to an object, 
-which keeps the object alive for GC. It does not consider a uintptr as such a reference. 
-(That is, while unsafe.Pointer has a pointer type, uintptr has integer type.)
+    - a socket id created via a syscall with the appropriate family, sotype and protocol.
 
-uintptr is simply an integer representation of a memory address, regardless of the actual type 
-it points to. Sort of like void * in C, or just casting a pointer to an integer. 
-It's purpose is to be used in unsafe black magic, and it is not used in everyday go code.
+    - This syscall should return a new socket file descriptor
 
-You are conflating uintptr and *uint. uintptr is used when you're dealing with pointers, 
-it is a datatype that is large enough to hold a pointer. It is mainly used for unsafe memory access, 
-look at the unsafe package. *uint is a pointer to an unsigned integer.
+    - After that default options are set on the socket (src/net/sockopt_linux.go)
+  
+    ```go
+	func setDefaultSockopts(s, family, sotype int, ipv6only bool) error {
+		if family == syscall.AF_INET6 && sotype != syscall.SOCK_RAW {
+			// Allow both IP versions even if the OS default
+			// is otherwise. Note that some operating systems
+			// never admit this option.
+			syscall.SetsockoptInt(s, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, boolint(ipv6only))
+		}
+		if (sotype == syscall.SOCK_DGRAM || sotype == syscall.SOCK_RAW) && family != syscall.AF_UNIX {
+			// Allow broadcast.
+			return os.NewSyscallError("setsockopt", syscall.SetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1))
+		}
+		return nil
+	}
+	```
 
+	- After that the socket descriptor together with it's family, sotype and net is passed into
+      newFD() which should return a new *netFD ready for asyncio (net in this case can either be
+	  "unix", "unix4", "unix6", "unixgram4", "unixgram6", "unixpacket", "unixpacket4", "unixpacket6", "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6").
+	  (src/net/fd_unix.go)
 
-------------------------------------------------------------------------------------------------------------
+	- newFD() initializes and returns *netFD with the following fields:
 
-EPOLLIN
-   The associated file is available for read(2) operations.
+    	```go
+		// Network file descriptor.
+	  	ret := &netFD{
+			pfd: poll.FD{
+				// System file descriptor. Immutable until Close.
+				Sysfd:         sysfd,
+				// Whether this is a streaming descriptor, as opposed to a
+				// packet-based descriptor like a UDP socket. Immutable.
+				IsStream:      sotype == syscall.SOCK_STREAM,
+				// Whether a zero byte read indicates EOF. This is false for a
+				// message based socket connection.
+				ZeroReadIsEOF: sotype != syscall.SOCK_DGRAM && sotype != syscall.SOCK_RAW,
 
-EPOLLOUT
-   The associated file is available for write(2) operations.
+				// Other fields not initialized here in newFD()
+				// ==============================================
 
-EPOLLRDHUP (since Linux 2.6.17)
-   Stream socket peer closed connection, or shut down writing
-   half of connection.  (This flag is especially useful for
-   writing simple code to detect peer shutdown when using
-   edge-triggered monitoring.)
+				// Lock sysfd and serialize access to Read and Write methods.
+				/* fdmu fdMutex */
 
-EPOLLERR
-   Error condition happened on the associated file
-   descriptor.  This event is also reported for the write end
-   of a pipe when the read end has been closed.
-   epoll_wait(2) will always report for this event; it is not
-   necessary to set it in events when calling epoll_ctl().
+				// Platform dependent state of the file descriptor.
+				/* SysFile */
 
-EPOLLHUP
-   Hang up happened on the associated file descriptor.
-   epoll_wait(2) will always wait for this event; it is not
-   necessary to set it in events when calling epoll_ctl().
-   Note that when reading from a channel such as a pipe or a
-   stream socket, this event merely indicates that the peer
-   closed its end of the channel.  Subsequent reads from the
-   channel will return 0 (end of file) only after all
-   outstanding data in the channel has been consumed.
+				// I/O poller (epoll fd, will be initialized only once,
+				// when first netFd's init() method is called).
+				/*pd pollDesc */
 
-EPOLLET
-   Requests edge-triggered notification for the associated
-   file descriptor.  The default behavior for epoll is level-
-   triggered.  See epoll(7) for more detailed information
-   about edge-triggered and level-triggered notification.
-   This flag is an input flag for the event.events field when
-   calling epoll_ctl(); it is never returned by
-   epoll_wait(2).
+				// Semaphore signaled when file is closed.
+				/* csema uint32 */
 
+				// Non-zero if this file has been set to blocking mode.
+				/* isBlocking uint32 */
 
-------------------------------------------------------------------------------------------------------------
+				// Whether this is a file rather than a network socket.
+				/* isFile bool */
+			},
+			// immutable until Close
+			family: family,
+			sotype: sotype,
+			net:    net,
 
+			// Other fields not initialized here in newFD()
+			// ==============================================
 
-src/runtime/netpoll.go
-src/runtime/netpoll_epoll.go
+			/*
+			isConnected bool // handshake completed or use of association with peer
+			laddr       Addr
+			raddr       Addr
+			*/
+		}
+	  	```
+	 
+	- This *netFD is returned to the initial socket function.
 
-https://github.com/golang/go/blob/master/src/runtime/HACKING.md
-https://habr.com/ru/company/infopulse/blog/415259/
-https://habr.com/ru/post/416669/
-https://www.opennet.ru/base/dev/epoll_example.txt.html
-https://habr.com/ru/post/416669/
-https://venkateshabbarapu.blogspot.com/2013/03/edge-triggered-vs-level-triggered.html
+    - If the socket function had a laddr (listen address) passed, then in case of TCP the listenStream() method
+      is called on the *netFD (max listener backlog on Linux is read from the "/proc/sys/net/core/somaxconn" 
+	  file, or a default of 128 is used on error or if somaxconn is 0, if somaxconn is greater than 65535 and 
+	  we are on Linux kernel version < 4.1, which can pass backlog only as uint16, we have to cap the backlog to max
+	  uint16, which is exactly 65535, on Linux >= 4.1, we can have a much bigger backlog read from somaxconn).
 
+	- *netFDs listenStream() method binds the socket to the listen address and calls listen on it. After that it
+       calls *netFDs init() method, which in turn calls its underlying "poll.FD's" Init() method. 
 
+	- If this is the first socket in our golang program, then an EPOLL kernel instance is created with 
+      syscall.EPOLL_CLOEXEC flag, and its file descriptor is stored in the `epfd` global variable 
+	  (src/runtime/netpoll_epoll.go).
+	  Creates a non-blocking unix pipe and registering its read end to be tracked by epoll 
+	  (the corresponding write end will be used to unblock epoll_wait syscalls by writing  a zero-byte to it, 
+	  which will trigger an I/O event on the read end, both fds of the pipe are global variables netpollBreakRd 
+	  and netpollBreakWr).
+	  Atomically sets the netpollInited global variable flag.
 
+#### src/internal/poll/fd_poll_runtime.go:pollDesc.init()
 
-============================================================================================================
-
-
-
-
-TODO !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
-src/internal/poll/fd_mutex.go:fdMutex
-
-type fdMutex struct {
-	state uint64
-	rsema uint32
-	wsema uint32
-}
-
-TODO!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-getbinary = lambda x, n: format(x, 'b').zfill(n)
-
-
-------------------------------------------------------------------------------------------------------------
-
-
-src/internal/poll/fd_mutex.go:fdMutex.rwlock()
-
-func (mu *fdMutex) rwlock(read bool) bool {}
-
-1) 
-
-
-
-
-============================================================================================================
-
-
-
-src/internal/poll/fd_poll_runtime.go:pollDesc
-
-type pollDesc struct {
-	runtimeCtx uintptr  // is a pointer to src/runtime/netpoll.go:pollDesc
-}
-
-TODO!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
-
-------------------------------------------------------------------------------------------------------------
-
-
-src/internal/poll/fd_poll_runtime.go:pollDesc.init()
-
+```go
 func (pd *pollDesc) init(fd *FD) error {}
+```
 
 1) Only on the globally first call (via sync.Once) initializes an epoll control kernel structure and 
    stores its fd in the epfd global variable.
@@ -149,8 +131,8 @@ func (pd *pollDesc) init(fd *FD) error {}
 
       - Atomically setting the netpollInited global variable flag
 
-2) Creates or reuses a pointer to an instance of src/runtime/netpoll.go:pollDesc, registers 
-   the underlying os fd extracted from *FD via epoll_ctl in edge-triggered mode to be simultaneously 
+2) Creates or reuses a pointer to an instance of src/runtime/netpoll.go:pollDesc (off-go-heap singly-linked list cache), 
+   registers the underlying os fd extracted from *FD via epoll_ctl in edge-triggered (EPOLLET) mode to be simultaneously 
    polled for read, write and peer shutdown events.
    This includes: 
       - Getting a pointer to src/runtime/netpoll.go:pollDesc from a freshly or 
@@ -168,7 +150,120 @@ func (pd *pollDesc) init(fd *FD) error {}
    an Errno error wrapper and returned.
 
 4) Otherwise stores a pointer to the resulting src/runtime/netpoll.go:pollDesc in 
-   the .runtimeCtx field.
+   the src/internal/poll/fd_poll_runtime.go:pollDesc .runtimeCtx field (which is a uintptr, not tracked by GC).
+
+
+5) After that *netFD is returned to the caller of socket(), with initialzed epoll and registered with it to be tracked for 
+   for read, write and peer shutdown events.
+
+
+#### src/internal/poll/fd_poll_runtime.go:pollDesc
+
+
+```go
+type pollDesc struct {
+   // Basically points to an off-heap struct not tracked by GC, 
+   // that's why it's not an unsafe.Pointer
+   // The runtime system considers an unsafe.Pointer as a reference 
+   // to an object, which keeps the object alive for GC. It does not 
+   // consider a uintptr as such a reference. (That is, while unsafe.Pointer 
+   // has a pointer type, uintptr has integer type.),
+   runtimeCtx uintptr 
+   // points to
+   //    |
+   //    |
+   //    V
+   // Network poller descriptor (at src/runtime/netpoll.go)
+   //
+   // No heap pointers.
+   type pollDesc struct {
+   	_     sys.NotInHeap
+   	link  *pollDesc      // in pollcache, protected by pollcache.lock
+   	fd    uintptr        // constant for pollDesc usage lifetime
+   	fdseq atomic.Uintptr // protects against stale pollDesc
+   
+   	// atomicInfo holds bits from closing, rd, and wd,
+   	// which are only ever written while holding the lock,
+   	// summarized for use by netpollcheckerr,
+   	// which cannot acquire the lock.
+   	// After writing these fields under lock in a way that
+   	// might change the summary, code must call publishInfo
+   	// before releasing the lock.
+   	// Code that changes fields and then calls netpollunblock
+   	// (while still holding the lock) must call publishInfo
+   	// before calling netpollunblock, because publishInfo is what
+   	// stops netpollblock from blocking anew
+   	// (by changing the result of netpollcheckerr).
+   	// atomicInfo also holds the eventErr bit,
+   	// recording whether a poll event on the fd got an error;
+   	// atomicInfo is the only source of truth for that bit.
+   	atomicInfo atomic.Uint32 // atomic pollInfo
+   
+   	// rg, wg are accessed atomically and hold g pointers.
+   	// (Using atomic.Uintptr here is similar to using guintptr elsewhere.)
+   	rg atomic.Uintptr // pdReady, pdWait, G waiting for read or pdNil
+   	wg atomic.Uintptr // pdReady, pdWait, G waiting for write or pdNil
+   
+   	lock    mutex // protects the following fields
+   	closing bool
+   	user    uint32    // user settable cookie
+   	rseq    uintptr   // protects from stale read timers
+   	rt      timer     // read deadline timer (set if rt.f != nil)
+   	rd      int64     // read deadline (a nanotime in the future, -1 when expired)
+   	wseq    uintptr   // protects from stale write timers
+   	wt      timer     // write deadline timer
+   	wd      int64     // write deadline (a nanotime in the future, -1 when expired)
+   	self    *pollDesc // storage for indirect interface. See (*pollDesc).makeArg.
+   }
+}
+```
+
+
+#
+
+
+
+#### src/internal/poll/fd_poll_runtime.go:pollDesc.init()
+
+```go
+func (pd *pollDesc) init(fd *FD) error {}
+```
+
+1) 
+
+
+1) Only on the globally first call (via sync.Once) initializes an epoll control kernel structure and 
+   stores its fd in the epfd global variable.
+   This includes:
+      - Initializing the epoll control kernel structure and storing its handle fd 
+        in the epfd global variable
+
+      - Creating a non-blocking unix pipe and registering its read end to be tracked by epoll
+        (the corresponding write end will be used to unblock epoll_wait syscalls by writing 
+         a zero-byte to it, which will trigger an I/O event on the read end).
+
+      - Atomically setting the netpollInited global variable flag
+
+2) Creates or reuses a pointer to an instance of src/runtime/netpoll.go:pollDesc (off-go-heap singly-linked list cache), 
+   registers the underlying os fd extracted from *FD via epoll_ctl in edge-triggered (EPOLLET) mode to be simultaneously 
+   polled for read, write and peer shutdown events.
+   This includes: 
+      - Getting a pointer to src/runtime/netpoll.go:pollDesc from a freshly or 
+        already allocated src/runtime/netpoll.go:pollcache. The cache resides in 
+        mmaped non-GC memory. Must be in non-GC memory because sometimes during its lifecycle a
+        src/runtime/netpoll.go:pollDesc is referenced only from epoll/kqueue internals.
+
+      - Registering the underlying os fd via epoll_ctl in edge-triggered mode to be 
+        simultaneously polled for read, write and peer shutdown events.
+        Before calling epoll_ctl an unaligned pointer to src/runtime/netpoll.go:pollDesc is stored 
+        in the epoll event's data field. This pointer will be later passed in to a callback function, 
+        which fires when an I/O event is registered on the underlying fd.
+
+3) If an error occurs while doing the epoll_ctl syscall, the errno is transformed into
+   an Errno error wrapper and returned.
+
+4) Otherwise stores a pointer to the resulting src/runtime/netpoll.go:pollDesc in 
+   the src/internal/poll/fd_poll_runtime.go:pollDesc .runtimeCtx field (which is a uintptr, not tracked by GC).
 
 
 ------------------------------------------------------------------------------------------------------------
@@ -183,15 +278,40 @@ func (pd *pollDesc) close() {}
    wasn't initialized or is already closed, so we return from this function immediately.
 
 2) evict() should be called on pd before this method is called. 
-   It will mark any read and/or write goroutines blocked on the fd as ready to run. 
-   The runtime will try to put them on their corresponding local run queues. 
-   They will be put in the _p_.runnext slot. If the local run queue is full, 
-   the goroutines will be put on the global run queue. After the goroutines are scheduled 
-   they will find out that the pollDesc is closed and will return the ErrNetClosing error 
-   to the caller of waitRead/waitWrite.
+   (src/internal/poll/fd_poll_runtime.go => src/runtime/netpoll.go:poll_runtime_pollUnblock(pd *pollDesc)).
+   Under *pollDesc's lock will set its `.closing` field to true. And increment its `.rseq` and `.wseq` fields.
+
+   TODO!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!seq fields
+
+   After that it will call *pollDesc's `publishInfo()` method, which while still holding *pollDesc's lock will 
+   updates pd.atomicInfo (returned by pd.info) using the other values in pd. It must be called while holding pd.lock,
+   and it must be called after changing anything that might affect the info bits. In practice this means after changing closing or changing rd or wd from < 0 to >= 0. In the current case it will just binrary or the `pollClosing` bit
+   with the atomic info. 
+
+   TODO!!!!!!!!! add more info about:
+   ```go
+   info |= uint32(pd.fdseq.Load()&pollFDSeqMask) << pollFDSeq
+   ```
+
+   Aftee that it will mark any read and/or write goroutines blocked on the fd as ready to run,
+   meaning that *pollDesc's `.rg` and `.wg` goroutine pointers will become nil pointers. The
+   returned goroutines (from `.rg` and/or `.wg`) will be stored in local variables just for now.
+   If the *pollDesc hand any read or write deadline timers associated with them, they will be deleted
+   and reset ton nil in *pollDesc `.rt` and/or `.wt` fields.
+
+   Only now *pollDesc lock can be released, since it will no longer be modified. 
+
+   The runtime will try to put the `.rg` and/or `.wg` goroutines on their corresponding local run queues. 
+   They will be put in the _p_.runnext slot (the P in which context's pollDesc.close() was called). 
+   If the local run queue is full, the goroutines will be put on the global run queue. After the goroutines 
+   are scheduled they will find out that the pollDesc is closed and will return the pollErrClosing error 
+   to the caller of waitRead/waitWrite. This error will be transformed to ErrNetClosing during bubbling up
+   to higher levels.
    (check out src/runtime/netpoll.go:poll_runtime_pollUnblock() for more details).
 
 3) Removes the underlying os fd from being tracked by the epoll kernel structure.
+
+4) The *pollDesc will be also returned back to the off-go-heap singly list cache.
 
 
 ------------------------------------------------------------------------------------------------------------
@@ -207,12 +327,35 @@ Evicts fd from the pending list, unblocking any I/O running on fd.
    the .runtimeCtx field, it means that pd isn't supported by epoll, 
    wasn't initialized or is already closed, so we return from this function immediately.
 
-2) If either a read/write goroutine or both were previously blocked on the underlying os fd
-   they will be marked as ready to run. The runtime will try to put them on their 
-   corresponding local run queues. They will be put in the _p_.runnext slot.
-   If the local run queue is full, the goroutines will be put on the global run queue.
-   After the goroutines are scheduled they will find out that the pollDesc is closed and will
-   return the ErrNetClosing error to the caller of waitRead/waitWrite.
+2) src/internal/poll/fd_poll_runtime.go => src/runtime/netpoll.go:poll_runtime_pollUnblock(pd *pollDesc)).
+   Under *pollDesc's lock will set its `.closing` field to true. And increment its `.rseq` and `.wseq` fields.
+
+   TODO!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!seq fields
+
+   After that it will call *pollDesc's `publishInfo()` method, which while still holding *pollDesc's lock will 
+   updates pd.atomicInfo (returned by pd.info) using the other values in pd. It must be called while holding pd.lock,
+   and it must be called after changing anything that might affect the info bits. In practice this means after changing closing or changing rd or wd from < 0 to >= 0. In the current case it will just binrary or the `pollClosing` bit
+   with the atomic info. 
+
+   TODO!!!!!!!!! add more info about:
+   ```go
+   info |= uint32(pd.fdseq.Load()&pollFDSeqMask) << pollFDSeq
+   ```
+
+   Aftee that it will mark any read and/or write goroutines blocked on the fd as ready to run,
+   meaning that *pollDesc's `.rg` and `.wg` goroutine pointers will become nil pointers. The
+   returned goroutines (from `.rg` and/or `.wg`) will be stored in local variables just for now.
+   If the *pollDesc hand any read or write deadline timers associated with them, they will be deleted
+   and reset ton nil in *pollDesc `.rt` and/or `.wt` fields.
+
+   Only now *pollDesc lock can be released, since it will no longer be modified. 
+
+   The runtime will try to put the `.rg` and/or `.wg` goroutines on their corresponding local run queues. 
+   They will be put in the _p_.runnext slot (the P in which context's pollDesc.close() was called). 
+   If the local run queue is full, the goroutines will be put on the global run queue. After the goroutines 
+   are scheduled they will find out that the pollDesc is closed and will return the pollErrClosing error 
+   to the caller of waitRead/waitWrite. This error will be transformed to ErrNetClosing during bubbling up
+   to higher levels.
    (check out src/runtime/netpoll.go:poll_runtime_pollUnblock() for more details).
 
 
@@ -232,8 +375,8 @@ func (pd *pollDesc) prepare(mode int, isFile bool) error {}
    so that no additional sys calls should be made each time the mode 
    is requested to be switched. 
    
-   Stores a nil pointer instead of a read/write (depending on the mode specified) 
-   goroutine blocked on this particular fd (if any).
+   Stores a nil pointer in the read/write (rg/wg) fields (depending on the mode specified) 
+   instead of a particular goroutine blocked on this particular fd (if any).
    This signifies that no goroutine is currently using this pollDesc to read/write.
    But it may so after resetting the mode.
 
@@ -305,7 +448,7 @@ func (pd *pollDesc) prepareWrite(isFile bool) error {}
 ------------------------------------------------------------------------------------------------------------
 
 
-src/internal/poll/fd_poll_runtime.go:pollDesc.wait()
+src/internal/poll/fd_poll_runtime.go:pollDesc.wait() => src/runtime/netpoll.go:poll_runtime_pollWait()
 
 func (pd *pollDesc) wait(mode int, isFile bool) error {}
 
@@ -318,31 +461,161 @@ func (pd *pollDesc) wait(mode int, isFile bool) error {}
    ErrNetClosing/ErrFileClosing, or ErrDeadlineExceeded or ErrNotPollable errors
    are returned respectively.
 
-3) If an event is already pending for the requested I/O mode nil is returned immediately
+3) If an event is already pending for the requested I/O mode nil (pollNoError) is returned immediately
    to the caller of this method, signifying that the next I/O syscall in the specified mode 
-   will not block.
+   will not block (will not yield EAGAIN, if there's enough data in the socket buffer).
 
 4) Otherwise we advertise that we're about to block on I/O by atomically setting .runtimeCtx's
-   semaphore to pdWait. 
-   If meanwhile another goroutine blocked on this particular pd in the same mode a panic is thrown:
-   "runtime: double wait"
+   semaphore (`.rg` or `.wg` goroutine pointer fields) to pdWait. 
+   If the semaphore (`.rg` or `.wg`) is already set pdWait state of points to a goroutine, it means,
+   that someone is already waiting of this poll descriptor to be reado to read or write (depending on th mode),
+   so a "runtime: double wait" panic is thrown.
 
 5) Recheks that the pd isn't closed, hasn't timed out on I/O and no error occured 
    during scanning for epoll events, otherwise a corresponding error will be returned.
 
 6) Before parking the current goroutine, which called this method, tries to atomically
-   store a pointer to this goroutine in .runtimeCtx's semaphore.
+   store a pointer to this goroutine in .runtimeCtx's semaphore (via `netpollblockcommit()` callback)
    After that the count of goroutines blocked on the netpoller is 
    atomically incremented (used by the runtime to skip netpolling if no goroutines are doing I/O).
 
-   If the store succeeds, it means that pd wan't closed, no I/O deadline or
-   scanning error occured just before we're about to park the goroutine.
+   If the store of the goroutine in `netpollblockcommit()` succeeds, it means that pd wan't closed, 
+   no I/O deadline or scanning error occured just before we're about to park the goroutine.
    Otherwise the current goroutine will not be parked and the pending error will be returned
    to the caller immediately.
 
 7) Parks the currently executing goroutine, suspending this function call until 
    the goroutine is scheduled back either when the requested I/O event occurs, deadline is reached 
    or this pd is closed.
+
+   ```go
+   gopark(netpollblockcommit, unsafe.Pointer(gpp), waitReasonIOWait, traceBlockNet, 5)
+
+   // Puts the current goroutine into a waiting state and calls unlockf on the
+   // system stack.
+   //
+   // If unlockf returns false, the goroutine is resumed.
+   //
+   // unlockf must not access this G's stack, as it may be moved between
+   // the call to gopark and the call to unlockf.
+   //
+   // Note that because unlockf is called after putting the G into a waiting
+   // state, the G may have already been readied by the time unlockf is called
+   // unless there is external synchronization preventing the G from being
+   // readied. If unlockf returns false, it must guarantee that the G cannot be
+   // externally readied.
+   // Reason explains why the goroutine has been parked. It is displayed in stack
+   // traces and heap dumps. Reasons should be unique and descriptive. Do not
+   // re-use reasons, add new ones.
+   func gopark(
+      unlockf func(*g, unsafe.Pointer) bool, 
+      lock unsafe.Pointer, 
+      reason waitReason, 
+      traceEv byte, 
+      traceskip int,
+    ) {
+   	if reason != waitReasonSleep {
+   		checkTimeouts() // no-op on every system except JS
+   	}
+
+   	// bumps up the count of acquired or pending
+   	// to be acquired futex-based mutexes by this M.
+   	// Returns the current M.
+   	// TODO: 'keeps the garbage collector from being invoked'?
+   	// TODO: 'keeps the G from moving to another M?'
+   	mp := acquirem()
+   	gp := mp.curg // current running goroutine that called gopark
+   	status := readgstatus(gp)
+   	// if the current goroutine that is about to park itself isn't running user code
+   	// or has just received a GC signal to scan its own stack, then it's a runtime error
+   	if status != _Grunning && status != _Gscanrunning {
+   		throw("gopark: bad g status")
+   	}
+
+   	mp.waitlock = lock // in case of a channel gopark, it's a pointer to hchan's lock
+   	// TODO:
+   	mp.waitunlockf = unlockf     // in case of a channel gopark, it's a callback that does TODO!!!! and unlocks hchan's lock
+   	gp.waitreason = reason       // in case of a channel gopark. it's waitReasonChanReceive
+   	mp.waittraceev = traceEv     // TODO:
+   	mp.waittraceskip = traceskip // TODO:
+   	// decreases the count of acquired or pending
+   	// to be acquired futex-based mutexes by this M.
+   	// TODO: and if there're no acquired or pending mutexes
+   	// restores the stack preemption request if one was pending
+   	// on the current goroutine.
+   	releasem(mp)
+   	// can't do anything that might move the G between Ms here.
+   	mcall(park_m) // never returns, saves this G's exeuction context and switches to g0 stack to call the passed in function
+   }
+
+   // link - src/runtime/asm_amd64.s
+   // mcall switches from the g to the g0 stack and invokes fn(g),
+   // where g is the goroutine that made the call.
+   // mcall saves g's current PC/SP in g->sched so that it can be restored later.
+   // It is up to fn to arrange for that later execution, typically by recording
+   // g in a data structure, causing something to call ready(g) later.
+   // In our case pointer to G is stored in poll.FDs .rg attribute, and poll.FD which 
+   // is stored in epoll's event data,
+   // so when there's data to be read this parked goroutine can be woken up.
+   // mcall returns to the original goroutine g later, when g has been rescheduled.
+   // fn must not return at all; typically it ends by calling schedule, to let the m
+   // run other goroutines.
+   //
+   // mcall can only be called from g stacks (not g0, not gsignal).
+   //
+   // This must NOT be go:noescape: if fn is a stack-allocated closure,
+   // fn puts g on a run queue, and g executes before fn returns, the
+   // closure will be invalidated while it is still executing.
+   func mcall(fn func(*g))
+
+   // park g's continuation on g0.
+   // called on g0's system stack.
+   // by this time g's rbp, rsp and rip (PC)
+   // are saved in g's .sched<gobuf>.
+   func park_m(gp *g) {
+   	mp := getg().m
+
+   	// TODO!!!!! if trace.enabled {}
+
+   	// N.B. Not using casGToWaiting here because the waitreason is
+   	// set by park_m's caller - `gopark()`.
+   	// Will loop if the g->atomicstatus is in a Gscan status until the routine that
+   	// put it in the Gscan state is finished (spins for 2.5 to 5 microseconds in between
+   	// yielding to the OS scheduler).
+   	casgstatus(gp, _Grunning, _Gwaiting)
+   	dropg() // sets `gp`s M association to nil + sets M's `.curg` association with `gp` to nil
+
+   	// `mp.waitunlockf` function passed into `gopark()` and saved in M, this function determines if
+   	// the goroutine should still be parked (if does not return false), does some additional
+   	// bookkeeping depending on the concrete function and unlocks the waitlock, passed in
+   	// to `gopark()` and saved in `mp.waitlock`.
+   	//
+   	// Channel recieve example, function `chanparkcommit`:
+   	// 		chanparkcommit is called as part of the `gopark` routine
+   	//      after the goroutine's status transfers to `_Gwaiting` and
+   	//      the goroutine is dissasociated from the M, which was executing
+   	//      it, BUT just before another goroutine gets scheduled by g0.
+   	//
+   	//      The main responsibility of chanparkcommit is to set goroutine's
+   	//      `activeStackChans` attribute to true, which tells the other parts
+   	//      of the runtime that there are unlocked sudogs that point into gp's stack (sudog.elem).
+   	//      So stack copying must lock the channels of those sudogs.
+   	//      In the end chanparkcommit unlocks channel's lock and returns true,
+   	//      which tells `gopark` to go on an schedule another goroutine.
+   	if fn := mp.waitunlockf; fn != nil {
+   		ok := fn(gp, mp.waitlock)
+   		mp.waitunlockf = nil
+   		mp.waitlock = nil
+   		if !ok { // some condition met, so that we don't need to park the goroutine anymore
+   			// TODO!!!!! if trace.enabled {}
+   			casgstatus(gp, _Gwaiting, _Grunnable) // transition goroutine back to _Grunnable
+   			execute(gp, true)                     // Schedule it back, never returns.
+   		}
+   	}
+
+	   // already on g0, schedule another goroutine
+	   schedule()
+   ```
 
 8) If this goroutine will be unblocked because of an I/O deadline or pd closure, the corresponding
    error will be returned to the caller.
@@ -351,6 +624,8 @@ func (pd *pollDesc) wait(mode int, isFile bool) error {}
    previously executing this function is scheduled back to be run in the near future, thus 
    resuming this method call and returning nil to the caller, signifying that the next I/O syscall 
    in the specified mode will not block.
+
+   TODO!!!!!!!!!!!!!!!!!!!!! add details about how it will be scheduled back.
 
 10) In both cases .runtimeCtx's semaphore is reset to nil.
 
@@ -371,7 +646,7 @@ func (pd *pollDesc) waitRead(isFile bool) error {}
    ErrNetClosing/ErrFileClosing, or ErrDeadlineExceeded or ErrNotPollable errors
    are returned respectively.
 
-3) If a read event is already pending nil is returned immediately to the caller of this method, 
+3) If a read event is already pending pollNoError code is returned immediately to the caller of this method, 
    signifying that the next read syscall will not block.
 
 4) Otherwise we advertise that we're about to block on I/O by atomically setting .runtimeCtx's
@@ -383,7 +658,10 @@ func (pd *pollDesc) waitRead(isFile bool) error {}
    during scanning for epoll events, otherwise a corresponding error will be returned.
 
 6) Before parking the current goroutine, which called this method, tries to atomically
-   store a pointer to this goroutine in .runtimeCtx's semaphore.
+   store a pointer to this goroutine in .runtimeCtx's 
+      // rg accessed atomically and hold g pointers.
+	   // (Using atomic.Uintptr here is similar to using guintptr elsewhere.)
+	   rg atomic.Uintptr // pdReady, pdWait, G waiting for read or pdNil
    After that the count of goroutines blocked on the netpoller is 
    atomically incremented (used by the runtime to skip netpolling if no goroutines are doing I/O).
 
@@ -396,22 +674,154 @@ func (pd *pollDesc) waitRead(isFile bool) error {}
    the goroutine is scheduled back either when a read epoll event occurs, deadline is reached 
    or this pd is closed.
 
+   ```go
+   gopark(netpollblockcommit, unsafe.Pointer(gpp), waitReasonIOWait, traceBlockNet, 5)
+
+   // Puts the current goroutine into a waiting state and calls unlockf on the
+   // system stack.
+   //
+   // If unlockf returns false, the goroutine is resumed.
+   //
+   // unlockf must not access this G's stack, as it may be moved between
+   // the call to gopark and the call to unlockf.
+   //
+   // Note that because unlockf is called after putting the G into a waiting
+   // state, the G may have already been readied by the time unlockf is called
+   // unless there is external synchronization preventing the G from being
+   // readied. If unlockf returns false, it must guarantee that the G cannot be
+   // externally readied.
+   // Reason explains why the goroutine has been parked. It is displayed in stack
+   // traces and heap dumps. Reasons should be unique and descriptive. Do not
+   // re-use reasons, add new ones.
+   func gopark(
+      unlockf func(*g, unsafe.Pointer) bool, 
+      lock unsafe.Pointer, 
+      reason waitReason, 
+      traceEv byte, 
+      traceskip int,
+    ) {
+   	if reason != waitReasonSleep {
+   		checkTimeouts() // no-op on every system except JS
+   	}
+
+   	// bumps up the count of acquired or pending
+   	// to be acquired futex-based mutexes by this M.
+   	// Returns the current M.
+   	// TODO: 'keeps the garbage collector from being invoked'?
+   	// TODO: 'keeps the G from moving to another M?'
+   	mp := acquirem()
+   	gp := mp.curg // current running goroutine that called gopark
+   	status := readgstatus(gp)
+   	// if the current goroutine that is about to park itself isn't running user code
+   	// or has just received a GC signal to scan its own stack, then it's a runtime error
+   	if status != _Grunning && status != _Gscanrunning {
+   		throw("gopark: bad g status")
+   	}
+
+   	mp.waitlock = lock // in case of a channel gopark, it's a pointer to hchan's lock
+   	// TODO:
+   	mp.waitunlockf = unlockf     // in case of a channel gopark, it's a callback that does TODO!!!! and unlocks hchan's lock
+   	gp.waitreason = reason       // in case of a channel gopark. it's waitReasonChanReceive
+   	mp.waittraceev = traceEv     // TODO:
+   	mp.waittraceskip = traceskip // TODO:
+   	// decreases the count of acquired or pending
+   	// to be acquired futex-based mutexes by this M.
+   	// TODO: and if there're no acquired or pending mutexes
+   	// restores the stack preemption request if one was pending
+   	// on the current goroutine.
+   	releasem(mp)
+   	// can't do anything that might move the G between Ms here.
+   	mcall(park_m) // never returns, saves this G's exeuction context and switches to g0 stack to call the passed in function
+   }
+
+   // link - src/runtime/asm_amd64.s
+   // mcall switches from the g to the g0 stack and invokes fn(g),
+   // where g is the goroutine that made the call.
+   // mcall saves g's current PC/SP in g->sched so that it can be restored later.
+   // It is up to fn to arrange for that later execution, typically by recording
+   // g in a data structure, causing something to call ready(g) later.
+   // In our case pointer to G is stored in poll.FDs .rg attribute, and poll.FD which 
+   // is stored in epoll's event data,
+   // so when there's data to be read this parked goroutine can be woken up.
+   // mcall returns to the original goroutine g later, when g has been rescheduled.
+   // fn must not return at all; typically it ends by calling schedule, to let the m
+   // run other goroutines.
+   //
+   // mcall can only be called from g stacks (not g0, not gsignal).
+   //
+   // This must NOT be go:noescape: if fn is a stack-allocated closure,
+   // fn puts g on a run queue, and g executes before fn returns, the
+   // closure will be invalidated while it is still executing.
+   func mcall(fn func(*g))
+
+   // park g's continuation on g0.
+   // called on g0's system stack.
+   // by this time g's rbp, rsp and rip (PC)
+   // are saved in g's .sched<gobuf>.
+   func park_m(gp *g) {
+   	mp := getg().m
+
+   	// TODO!!!!! if trace.enabled {}
+
+   	// N.B. Not using casGToWaiting here because the waitreason is
+   	// set by park_m's caller - `gopark()`.
+   	// Will loop if the g->atomicstatus is in a Gscan status until the routine that
+   	// put it in the Gscan state is finished (spins for 2.5 to 5 microseconds in between
+   	// yielding to the OS scheduler).
+   	casgstatus(gp, _Grunning, _Gwaiting)
+   	dropg() // sets `gp`s M association to nil + sets M's `.curg` association with `gp` to nil
+
+   	// `mp.waitunlockf` function passed into `gopark()` and saved in M, this function determines if
+   	// the goroutine should still be parked (if does not return false), does some additional
+   	// bookkeeping depending on the concrete function and unlocks the waitlock, passed in
+   	// to `gopark()` and saved in `mp.waitlock`.
+   	//
+   	// Channel recieve example, function `chanparkcommit`:
+   	// 		chanparkcommit is called as part of the `gopark` routine
+   	//      after the goroutine's status transfers to `_Gwaiting` and
+   	//      the goroutine is dissasociated from the M, which was executing
+   	//      it, BUT just before another goroutine gets scheduled by g0.
+   	//
+   	//      The main responsibility of chanparkcommit is to set goroutine's
+   	//      `activeStackChans` attribute to true, which tells the other parts
+   	//      of the runtime that there are unlocked sudogs that point into gp's stack (sudog.elem).
+   	//      So stack copying must lock the channels of those sudogs.
+   	//      In the end chanparkcommit unlocks channel's lock and returns true,
+   	//      which tells `gopark` to go on an schedule another goroutine.
+   	if fn := mp.waitunlockf; fn != nil {
+   		ok := fn(gp, mp.waitlock)
+   		mp.waitunlockf = nil
+   		mp.waitlock = nil
+   		if !ok { // some condition met, so that we don't need to park the goroutine anymore
+   			// TODO!!!!! if trace.enabled {}
+   			casgstatus(gp, _Gwaiting, _Grunnable) // transition goroutine back to _Grunnable
+   			execute(gp, true)                     // Schedule it back, never returns.
+   		}
+   	}
+
+	   // already on g0, schedule another goroutine
+	   schedule()
+   ```
+
 8) If this goroutine will be unblocked because of an I/O deadline or pd closure, the corresponding
    error will be returned to the caller.
 
 9) After the read event is registered by epoll on the undelying fd the goroutine 
    previously executing this function is scheduled back to be run in the near future, thus 
-   resuming this method call and returning nil to the caller, signifying that the next I/O syscall 
+   resuming this method call and returning true to the caller, signifying that the next I/O syscall 
    will not block.
 
-10) In both cases .runtimeCtx's semaphore is reset to nil.
+   TODO!!!!!!!!!!!!!!!!!!!!! add details about how it will be scheduled back.
+
+10) In both cases .runtimeCtx's rg is reset to nil, meaning that there's no current goroutine
+    waiting for an EPOLLIN event to occur.
 
 
 
 ------------------------------------------------------------------------------------------------------------
 
 
-src/internal/poll/fd_poll_runtime.go:pollDesc.waitWrite()
+src/internal/poll/fd_poll_runtime.go:pollDesc.waitWrite() (same as waitRead)
 
 func (pd *pollDesc) waitWrite(isFile bool) error {}
 
@@ -488,13 +898,16 @@ func setDeadlineImpl(fd *FD, t time.Time, mode int) error {}
 
 3) Increment reference to fdMutex. TODO!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
+src/runtime/netpoll.go:poll_runtime_pollSetDeadline(pd *pollDesc, d int64, mode int) 
+
 4) Reads the previous value of .runtimeCtx's read/write deadline into a local variable 
    and remembers whether a deadline was previously set.
 
 5) If the passed in deadline is equal to the currently set deadline this method becomes no-op 
    and returns immediately.
 
-6) If the passed in deadline is positive then a small nanoseconds jitter is added to it.
+6) If the passed in delay (`d`) in nanoseconds is positive then the deadline is calculated by adding the delay
+   to the current value of the MONOTONIC clock.
 
 7) Stores the new deadline in .runtimeCtx's corresponding deadline field.
 
@@ -503,7 +916,7 @@ func setDeadlineImpl(fd *FD, t time.Time, mode int) error {}
    In this case the blocked on I/O goroutine, if any, is woken up, the caller of the
    pollDesc.waitRead()/pollDesc.waitWrite() method will get ErrDeadlineExceeded error.
 
-9) If the deadline timer's callback function is NOT set to nil it means that the previous deadline
+9)  If the deadline timer's callback function is NOT set to nil it means that the previous deadline
    timer is still in progress and it needs to be invalidated. This is done by incrementing 
    .runtimeCtx's .rseq/.wseq field. When the invalidated timer's callback fires
 
@@ -758,7 +1171,7 @@ src/runtime/netpoll.go:poll_runtime_pollOpen()
                  to occure on the underlying fd)
 
      - 0 (nil pointer) - if no goroutine is currently blocked on I/O, 
-                         preparing to block on I/O or I/O readiness notification is pending
+                         not preparing to block on I/O or no I/O readiness notification is pending.
 
      - G pointer - the goroutine is parked and blocked on the semaphore waiting for I/O notification
 
@@ -817,7 +1230,7 @@ src/runtime/netpoll.go:poll_runtime_pollOpen()
 
 12) Registers the underlying os fd via epoll_ctl() in edge-triggered mode to be 
     simultaneously polled for read, write and peer shutdown events*. 
-    This is cheaper than making sys calls every time we want to switch an fd 
+    This is cheaper than making syscalls every time we want to switch an fd 
     to be polled for some other type of event. 
     So the process of recognizing which events are we currently tracking is deligated to 
     pollDesc and its .rg and .wg fields.
@@ -1092,7 +1505,9 @@ of I/O ready fds and their corresponding pollDescs.
 
 Declares that the fd associated with pollDesc is ready for I/O.
 The toRun argument is used to build a list of goroutines to return
-from the platform-specific netpoll function used by the runtime.
+from the platform-specific netpoll function used by the runtime (this
+function is called while iterating over events, and the gList is build
+up during the iterations).
 
 The mode argument is 'r', 'w', or 'r'+'w' to indicate
 whether the fd is ready for reading or writing or both.
@@ -1671,7 +2086,7 @@ delay > 0: block for up to that many nanoseconds
    it could be a signal interrupt (EINTR) - it occurs if another syscall fired while the epolwait 
    syscall was blocked indefinitely, this happens becuase the OS needs to somehow interrupt 
    indefinite syscalls if some other prioritized syscall occurs.
-   In the case of EINTR if the timeout specified was greateer than 0 and empty gList
+   In the case of EINTR if the timeout specified was greateer than 0 an empty gList
    without any goroutines is returned, this is done so the caller can recalculate a new
    delay taking the time that has already elapsed into account.
    If epollwait wasn't a blocking call or was an indefinite call, the same call to epollwait
@@ -1718,7 +2133,7 @@ delay > 0: block for up to that many nanoseconds
       - the socket was closed unexpectedly
       - an error condition occured on the associated fd
 
-   If at least one of this conditions is true a read flag is added to the resulting mode.
+   If at least one of th conditions is true a read flag is added to the resulting mode.
 
    Write mode is considered if:
       - the fd became available for non-blocking write

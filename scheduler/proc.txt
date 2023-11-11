@@ -1,0 +1,470 @@
+// mPark causes a thread to park itself, returning once woken.
+//
+//go:nosplit
+func mPark() {}
+
+Is only ever called on g0 goroutine with system scheduling stack.
+
+Uses current M's .park futex word to block until someone wakes 
+this thread up from sleeping on the word. 
+
+While this thread is sleeping the M's .blocked attribute is set to true.
+
+TODO!!!!!!!!!!!!!!!!!! who, why and when calls FUTEX_WAKE on M's .park futex word?
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+// Stops execution of the current m until new work is available.
+// Returns with acquired P.
+func stopm() {}
+
+Is only ever called by M's which are not possessed by any P and thus 
+execute code on the g0 scheduling (system) stack. The calling M also
+shouln't be in a spinning state and is not allowed to hold any runtime locks.
+TODO!!!!!!!!!!!!!!!!!! why shouldn't be spinning and isn't allowed to hold any locks?
+
+While holding the scheduler's lock puts the current M onto the scheduler's 
+global list of idle Ms.
+
+After that uses current M's .park futex word to block until someone wakes 
+this thread up from sleeping on the word.
+While this thread is sleeping the M's .blocked attribute is set to true.
+
+Before someone wakes this thread up via the same futex word, 
+an idle P is stored in M's .nextp attribute, so that when it wakes up 
+it can wire itself to that P.
+TODO!!!!!!!!!!!!!!!!!! how often this will be a new P, which may result in flushing the CPU cache
+
+After unblocking from sleeping on the futex word, wire's itself up to a P provided 
+by the code that unblocked this M.
+TODO!!!!!!!!!!!!!!!!!! acquirep details
+
+Is called by:
+    - schedule() as part of the GC stop the world, while g0 is in the midst of looking for work to do
+    
+    - schedule() if it can't find any work, a corresponding startm may wake the thread up
+
+    - TODO!!!!!!!!!!!!!!!!!! startlockedm
+
+    - TODO!!!!!!!!!!!!!!!!!! exitsyscall0
+
+Is woken up by:
+    - startTheWorldWithSema as part of GC
+
+    - startm TODO!!!!!!!!!!!!!!!!!! scenarios
+
+    - startlockedm TODO!!!!!!!!!!!!!!!!!!
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+// Schedules some M to run the p (creates an M if necessary).
+// If p==nil, tries to get an idle P, if no idle P's does nothing.
+// May run with m.p==nil, so write barriers are not allowed.
+// If spinning is set, the caller has incremented nmspinning and startm will
+// either decrement nmspinning or set m.spinning in the newly started M.
+//
+// Callers passing a non-nil P must call from a non-preemptible context. See
+// comment on acquirem below.
+//
+// Must not have write barriers because this may be called without a P.
+//
+//go:nowritebarrierrec
+func startm(_p_ *p, spinning bool) {}
+
+TODO!!!!!!!!!!!!!!!!!! when is a valid P passed in and when nil is passed in?
+
+Disable preemption.
+Every owned P must have an owner that will eventually stop it in the
+event of a GC stop request. startm takes transient ownership of a P
+(either from argument or pidleget below) and transfers ownership to
+a started M, which will be responsible for performing the stop.
+
+Preemption must be disabled during this transient ownership,
+otherwise the P this is running on may enter GC stop while still
+holding the transient P, leaving that P in limbo and deadlocking the STW.
+
+Callers passing a non-nil P must already be in non-preemptible
+context, otherwise such preemption could occur on function entry to
+startm. Callers passing a nil P may be preemptible, so we must
+disable preemption before acquiring a P from pidleget below.
+
+Gets the M running the current g and increments this M's .locks counter.
+TODO!!!!!!!!!!!!!!!!!! how is the .locks counter used?
+                       
+TODO!!!!!!!!!!!!!!!!!! lock(&sched.lock)
+
+TODO!!!!!!!!!!!!!!!!!! if _p_ == nil,  _p_, _ = pidleget(0)
+
+TODO!!!!!!!!!!!!!!!!!! mget
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func handoffp(_p_ *p) {}
+
+TODO!!!!!!!!!!!!!!!!!! Always runs without a P, so write barriers are not allowed.
+
+Hands off P from syscall or locked M to a spinning/idle/new M. TODO!!!!!!!!!!!!!!!!!! spinning?
+This means that if no Ms are currently idle or spinning in the system, a new OS thread will be created
+for the P.
+
+If work is available on P's local run queue or on the global run queue, gets an idle M 
+or initializes a new one together with a new OS thread, and instructs g0 to schedule some
+work to run.
+
+TODO!!!!!!!!!!!!!!!!!! if there's trace work to do or if it has GC work peforms 
+                       the same steps as described above
+
+If there's no work to do and there are no spinning or idle Ms in the system which may serve the P, 
+a new M will be allocated and an associated OS thread will be created. If an idle or spinning M appears in the system 
+just before the new M is allocated, then it will be used to serve the P. The new or idle M will start 
+in a spinning state. TODO!!!!!!!!!!!!!!!!!! spinning TODO!!!!!!!!!!!!!!!!!! sched.npidle
+
+If the scheduler is waiting to start a new GC cycle, P is transitioned into the _Pgcstop status,
+and if it was the last one in the system to do so, it will wake up the routine that's waiting for
+all Ps to come to a halt to turn on the write barrier. In this case P isn't handed of to anyone.
+
+TODO!!!!!!!!!!!!!!!!!! _p_.runSafePointFn
+
+If all of the above steps yielded a false result, then will rechek if there's any work available
+on the global run queue, and if there is, will get an idle M or initializes a new one together with a new OS thread, 
+and instruct g0 to schedule some work to run.
+
+If this is the last running P, meaning all of the other Ps are idle and nobody is currently polling the network,
+will wake up another idle M to poll the network. g0 will try to schedule some work to run, but because there isn't
+any (if nothing changes in between), will fallback to polling the network until the closest timer. 
+TODO!!!!!!!!!!!!!!!!!! more details about polling fallback and what happens if something changes in between?
+
+Otherwise if its not the last idle P (TODO!!!!!!!!!!!!!!!!!! can this happen in practice, what about work stealing?) 
+or someone is currently polling the network, for example sysmon (TODO!!!!!!!!!!!!!!!!!! who else?),
+P has no choice but put itself on the idle list.
+TODO!!!!!!!!!!!!!!!!!! wakeNetPoller
+
+TODO!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func findRunnable() (gp *g, inheritTime, tryWakeP bool) {}
+
+Finds a runnable goroutine to execute.
+Tries to steal from other P's, get g from local or global queue, poll network.
+TODO!!!!!!!!!!!!!!!!!! tryWakeP indicates that the returned goroutine is not normal 
+                       (GC worker, trace reader) so the caller should try to wake a P.
+
+Is only ever executed on the g0 scheduling goroutine?
+
+If the runtime requested to bring all Ms to a halt, because its about to stop the world for a GC cycle, 
+we release the current P and M to their respective idle lists and block the current OS thread on the M's
+.park futex word until it is woken up when the world starts again. If this is the last M to be paused before 
+stop the world happens, we wake up the part of the scheduler that is waiting until it can stop the world 
+through scheduler's .stopnote futex word. 
+After the world starts again the thread is unblocked and a P with work on its local run queue is randomly chosen 
+to run this M and this function starts all over again. If there were less Ps with local work than idle Ms it may happen
+so that the thread will remain blocked in the idle list after the world starts.
+
+TODO!!!!!!!!!!!!!!!!!! runSafePointFn, is used by forEachP which is used by GC phases
+
+Runs ready timers belonging to the current P - this will potentially fill the local run queue with some work.
+The value of `now` will be the current time and `pollUntil` will be the time left until the closest timer from this 
+P's heap.
+`now` and `pollUntil` are saved for work stealing later, which may steal timers. It's important that between now
+and then, nothing blocks, so these numbers remain mostly relevant.
+
+TODO!!!!!!!!!!!!!!!!!! Try to get the traceReader goroutine and return it to be scheduled
+
+TODO!!!!!!!!!!!!!!!!!! Try to get a background mark worker goroutine for P and return it to be scheduled
+
+Every 61th schedule (counts only goroutines scheduled with a new time slice) of a goroutine by the current P
+checks the global run queue and transfers a `runqsize/gomaxprocs + 1` fraction of goroutines to the local run queue.
+If at least one goroutine was transfered, returns it to be scheduled.
+
+TODO!!!!!!!!!!!!!!!!!! Wake up the finalizer G.
+
+Tries to get a goroutine from the local run queue, this either gets one from the P's runnext slot
+or from the queue itself. If successfully retrieved a goroutine from the local run queue, returns
+it to the caller to be scheduled, otherwise proceeds to poll the global run queue.
+
+If the global run queue is not empty retrieves a goroutine from it and returns it to the caller to be scheduled.
+
+Before resorting to stealing if there's at least one goroutine blocked on I/O and nobody is currently polling
+the network, polls the it in a non-blocking manner. If polling returned some goroutines, saves the first one
+for return and injects the others into:
+    - If there are idle Ps, tries to put as many goroutines as there are idle Ps or less onto the global run queue
+      and start Ms to run the idle Ps (not all if less goroutines than idle Ps).
+
+    - If there are any goroutines left over from the previous steps they are injected into the local run queue
+
+Will steal only if this M is already spinning, meaning that TODO!!!!!!!!!!!!!!!!!!,
+or the number of already spinning Ms is less than a half of the number of currently busy Ps.
+This is necessary to prevent excessive CPU consumption when GOMAXPROCS>1 but the program parallelism is low.
+
+First of all sched.nmspinning will be incremented and this M will enter spinning state to denote that it is 
+out of local work and did not find work in  the global run queue or netpoller. Spinning threads spin on looking 
+for work in per-P run queues and timer heaps  or from the GC before parking. If a spinning thread finds work 
+it takes itself out of the spinning state and proceeds to execution. If it does not find work it takes itself 
+out of the spinning state and then parks.
+
+If there is at least one spinning thread (sched.nmspinning>1), we don't unpark new threads when submitting work. 
+To compensate for that, if the last spinning thread finds work and stops spinning, it must unpark a new spinning
+thread.  This approach smooths out unjustified spikes of thread unparking, but at the same time guarantees eventual
+maximal CPU parallelism utilization.
+
+Makes 4 attempts to steal work, each attempt involves all currently non-idle Ps except the current one.
+
+During the first 3 attempts, tries to steal a half of the goroutines from each P's local run queue 
+until it is successfull. If successfull, one of the stolen goroutines will be returned to the caller to be scheduled 
+and the rest will be put onto the current P's local run queue. The other return values such as inheritTime and tryWakeP
+will be false.
+
+If the first 3 attempts did not yield any goroutine to return, on the last 4th attempt 
+will first try to run ready timers belonging to the other Ps hoping that they will fill this P's 
+local run queues with some work. After each run of the timers will try to get a goroutine from current P's
+local run queue and return it to the caller to be scheduled. The other returns values such as inheritTime 
+and tryWakeP will be the goroutine's inheritTime value TODO!!!!!!!!!!!!!!!!!! and false respectively.
+
+If the timers trick didn't yield any result on the last attempt, will try to steal from each P's .runnext slot. 
+If successfull, one of the stolen goroutines will be returned to the caller to be scheduled. The other return values 
+such as inheritTime and tryWakeP will be the goroutine's inheritTime value TODO!!!!!!!!!!!!!!!!!! and false respectively.
+
+If a new GC cycle is about to start while we're looking for work, then findRunnable will start from the beginning
+and go through all of the steps mentioned above. The same will happen if no goroutine is stolen and at least one 
+timer from the other non-idle Ps was run, because, even though it hasn't readied a goroutine on the current Ps local
+run queue, it may have added a new timer to the current Ps timer heap.
+
+If no goroutine was stolen, but there's at least one timer on any of the non-idle Ps including the current P, pollUntil will be 
+set to duration until the closest timer of them all.
+`now` will be the same `now` that was computed at the start of this procedure.
+
+Check if we're in the GC mark phase, can safely scan and blacken objects, and have work to do, run idle-time marking 
+rather than give up the P, so we repeat all of the steps described above.
+
+TODO!!!!!!!!!!!!!!!!!! reacheck runSafePointFn, is used by forEachP which is used by GC phases
+
+TODO!!!!!!!!!!!!!!!!!! Before we drop our P, make a snapshot of the allp slice,
+// which can change underfoot once we no longer block
+// safe-points. We don't need to snapshot the contents because
+// everything up to cap(allp) is immutable.
+allpSnapshot := allp
+// Also snapshot masks. Value changes are OK, but we can't allow
+// len to change out from under us.
+idlepMaskSnapshot := idlepMask
+timerpMaskSnapshot := timerpMask
+
+Before releasing the current P to the idle list, recheck for stop the world, runSafePointFn conditions as well
+as the global run queue. If in between some goroutine was added to the global run queue, it's returned to the caller
+straight away together with inheritTime and tryWakeP set to false. If the stop the world or runSafePointFn conditions are
+true, all of the above steps will be repeated once again, but with the current M marked as spinning (if we attempted
+to steal work earlier).
+
+TODO!!!!!!!!!!!!!!!!!! If we didn't try to steal work earlier 
+
+TODO!!!!!!!!!!!!!!!!!! now
+Releases the current P by disassociating it with the current M and setting its status to idle. M's pointer to P is also 
+zeroed out. After that the P is put onto the global idle list.
+
+TODO!!!!!!!!!!!!!!!!!!
+
+TODO!!!!!!!!!!!!!!!!!! // Worker thread parking/unparking.
+// We need to balance between keeping enough running worker threads to utilize
+// available hardware parallelism and parking excessive running worker threads
+// to conserve CPU resources and power. This is not simple for two reasons:
+// (1) scheduler state is intentionally distributed (in particular, per-P work
+// queues), so it is not possible to compute global predicates on fast paths;
+// (2) for optimal thread management we would need to know the future (don't park
+// a worker thread when a new goroutine will be readied in near future).
+//
+// Three rejected approaches that would work badly:
+// 1. Centralize all scheduler state (would inhibit scalability).
+// 2. Direct goroutine handoff. That is, when we ready a new goroutine and there
+//    is a spare P, unpark a thread and handoff it the thread and the goroutine.
+//    This would lead to thread state thrashing, as the thread that readied the
+//    goroutine can be out of work the very next moment, we will need to park it.
+//    Also, it would destroy locality of computation as we want to preserve
+//    dependent goroutines on the same thread; and introduce additional latency.
+// 3. Unpark an additional thread whenever we ready a goroutine and there is an
+//    idle P, but don't do handoff. This would lead to excessive thread parking/
+//    unparking as the additional threads will instantly park without discovering
+//    any work to do.
+//
+// The current approach:
+//
+// This approach applies to three primary sources of potential work: readying a
+// goroutine, new/modified-earlier timers, and idle-priority GC. See below for
+// additional details.
+//
+// We unpark an additional thread when we submit work if (this is wakep()):
+// 1. There is an idle P, and
+// 2. There are no "spinning" worker threads.
+//
+// A worker thread is considered spinning if it is out of local work and did
+// not find work in the global run queue or netpoller; the spinning state is
+// denoted in m.spinning and in sched.nmspinning. Threads unparked this way are
+// also considered spinning; we don't do goroutine handoff so such threads are
+// out of work initially. Spinning threads spin on looking for work in per-P
+// run queues and timer heaps or from the GC before parking. If a spinning
+// thread finds work it takes itself out of the spinning state and proceeds to
+// execution. If it does not find work it takes itself out of the spinning
+// state and then parks.
+//
+// If there is at least one spinning thread (sched.nmspinning>1), we don't
+// unpark new threads when submitting work. To compensate for that, if the last
+// spinning thread finds work and stops spinning, it must unpark a new spinning
+// thread. This approach smooths out unjustified spikes of thread unparking,
+// but at the same time guarantees eventual maximal CPU parallelism
+// utilization.
+//
+// The main implementation complication is that we need to be very careful
+// during spinning->non-spinning thread transition. This transition can race
+// with submission of new work, and either one part or another needs to unpark
+// another worker thread. If they both fail to do that, we can end up with
+// semi-persistent CPU underutilization.
+//
+// The general pattern for submission is:
+// 1. Submit work to the local run queue, timer heap, or GC state.
+// 2. #StoreLoad-style memory barrier.
+// 3. Check sched.nmspinning.
+//
+// The general pattern for spinning->non-spinning transition is:
+// 1. Decrement nmspinning.
+// 2. #StoreLoad-style memory barrier.
+// 3. Check all per-P work queues and GC for new work.
+//
+// Note that all this complexity does not apply to global run queue as we are
+// not sloppy about thread unparking when submitting to global queue. Also see
+// comments for nmspinning manipulation.
+//
+// How these different sources of work behave varies, though it doesn't affect
+// the synchronization approach:
+// * Ready goroutine: this is an obvious source of work; the goroutine is
+//   immediately ready and must run on some thread eventually.
+// * New/modified-earlier timer: The current timer implementation (see time.go)
+//   uses netpoll in a thread with no work available to wait for the soonest
+//   timer. If there is no thread waiting, we want a new spinning thread to go
+//   wait.
+// * Idle-priority GC: The GC wakes a stopped idle thread to contribute to
+//   background GC work (note: currently disabled per golang.org/issue/19112).
+//   Also see golang.org/issue/44313, as this should be extended to all GC
+//   workers.
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWork bool) {}
+
+Attempts to steal a runnable goroutine or timer from any P.
+
+If newWork is true, new work may have been readied.
+
+If now is not 0 it is the current time. stealWork returns the passed time or
+the current time if now was passed as 0.
+
+Makes 4 attempts to steal work from each P in the allp list.
+
+Each attempt iterates over the allp list in a shuffled order and tries to steal work 
+from one of the Ps until it is successfull. Idle Ps and the current P are skipped 
+(idle Ps only on first 3 attempts).
+
+During the first 3 attempts, tries to steal a half of the goroutines from each P's local run queue 
+until it is successfull. On success one of the stolen goroutines will be returned to the caller to be scheduled 
+and the rest will be put onto the current P's local run queue. 
+The return values of inheritTime, rnow, pollUntil and newWork will be equal to false, now, 0 and false respectively.
+During these attempts the other P's runnext slot will not be touched.
+
+If the first 3 attempts did not yield any goroutine to return, on the last 4th attempt 
+will first try to run ready timers belonging to the other Ps hoping that they will fill this P's 
+local run queues with some work. After each run of the timers will try to get a goroutine from current P's
+local run queue and return it to the caller to be scheduled. 
+The return values of inheritTime, rnow, pollUntil and newWork will be equal to:
+    - TODO!!!!!!!!!!!!!!!!!! inheritTime, 
+    - now or the current time if now is 0, 
+    - time until next ready timer (if any, otherwise 0) in timer heap of P on which the timers were run
+    - TODO!!!!!!!!!!!!!!!!!! false if the first retrieved P's timers yield some work, otherwise true
+respectively.
+ 
+If the timers trick doesn't yield any result on the last attempt, will try to steal from each 
+P's .runnext slot until it's successfull or else. 
+On every attempt to steal from .runnext will sleep for 3 microsenconds before doing so, because 
+it needs to be ensured that the P isn't about to run the g that is about to be stolen.
+The important use case here is when the g running on P ready()s another g and then almost
+immediately blocks. Instead of stealing runnext in this window, back off to give P a chance to
+schedule runnext. This will avoid thrashing gs between different Ps.
+A sync chan send/recv takes ~50ns as of time of writing, so 3 microsenconds gives ~50x overshoot.
+The return values of inheritTime, rnow, pollUntil and newWork will be equal to:
+    - false
+    - now or the current time if now is 0, 
+    - time until the closest timer on any of the other non-idle Ps
+    - true
+respectively.
+
+If during any of these attempts a GC cycle is triggered, then no goroutine will be stolen and returned,
+so that the caller has a chance to check if any GC work is available. The return values of gp, inheritTime, 
+rnow, pollUntil and newWork will be equal to nil, false, now, 0 and true respectively.
+
+If nothing of the above yielded work then a nil pointer will be returned for the goroutine and the 
+return values of inheritTime, rnow, pollUntil and newWork will be equal to:
+    - false,
+    - now or the current time if now is 0,
+    - time until the closest timer on any of the other non-idle Ps
+    - true 
+respectively.No goroutines found to steal. Regardless, running a timer may have made some goroutine ready that we missed. 
+Indicate the next timer to wait for.
+
+
+TODO!!!!!!!!!!!!!!!!!! how are the return values used and why are they calculated the way they are?
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+func retake(now int64) uint32 {}
+
+Is called on every sysmon tick (loop iteration) to retake P's blocked in syscalls 
+and preempt long running G's.
+
+TODO!!!!!!!!!!!!!!!!!! Does retaking a P means detaching it from the blocked M, and attaching it to a new M, 
+                       which may cause a new OS thread to be created?
+
+
+TODO!!!!!!!!!!!!!!!!!! preemt Gs and sysmon and scheduler ticks !!!!!!!!!!!!!!!!!!
+
+TODO!!!!!!!!!!!!!!!!!! handoffp
+
+
+------------------------------------------------------------------------------------------------------------
+
+
+// Put mp on midle list.
+// sched.lock must be held.
+// May run during STW, so write barriers are not allowed.
+//
+//go:nowritebarrierrec
+func mput(mp *m) {}
+
+Currently the only caller of this method within the runtime is stopm() 
+(check out stopm() for more details).
+
+Should only be called while holding sched's lock, because it
+mutates scheduler's state associated with idle Ms.
+
+Adds an M to scheduler's .midle singly-linked of idle Ms.
+This list is maintained through a .schedlink pointer available on every 
+M instance.
+
+TODO!!!!!!!!!!!!!!!!!! checkdead()
+
+
+------------------------------------------------------------------------------------------------------------
+
+func runqempty(_p_ *p) bool {}
+
+Reports whether _p_ has no Gs on its local run queue.
+Achieves that by comparing the circular queue's head and tail, which should be equal, 
+as well as checking that P's runnext slot is empty.
